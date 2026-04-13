@@ -62,7 +62,9 @@ cp config.sample.json config.json
    `sudo cp config.yaml /opt/clash-config/config.yaml`
    如果你使用的是自定义路径，则应复制到 `clash_config_path` 指定的位置，例如：
    `sudo cp config.yaml /data/clash/config.yaml`
-9. 下载 GeoIP 数据库：
+9. 按需准备 GeoIP 数据库：
+   只有当你的 Clash 配置中实际使用了 GeoIP 相关规则或功能时，才需要准备 `Country.mmdb`。
+   例如默认路径下可执行：
    `sudo wget -O /opt/clash-config/Country.mmdb https://github.com/Dreamacro/maxmind-geoip/releases/latest/download/Country.mmdb`
 
 可选检查：
