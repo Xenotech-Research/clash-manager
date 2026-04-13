@@ -62,6 +62,7 @@ cp config.sample.json config.json
    `sudo cp config.yaml /opt/clash-config/config.yaml`
    如果你使用的是自定义路径，则应复制到 `clash_config_path` 指定的位置，例如：
    `sudo cp config.yaml /data/clash/config.yaml`
+   如果该文件不存在，后端在首次启动 Clash 时也会自动创建一份最小可运行配置；但如果你已有自己的配置，仍然建议显式放置你要使用的 `config.yaml`。
 
 可选检查：
 
@@ -76,6 +77,7 @@ cp config.sample.json config.json
 - `/opt/clash/clash` 可以是真实文件，也可以像当前机器一样是一个软链接。
 - 只要 `config.json` 中的 `clash_bin` 指向一个可执行的 Clash 内核即可，不要求必须安装在 `/opt/clash/`。
 - `config.yaml` 需要与本项目配置一致，至少应保证 `external-controller: 127.0.0.1:9090`，并让代理端口与 `clash_mixed_port` 对应。
+- 若 `clash_config_path` 指向的文件不存在，后端会自动生成一份最小配置，确保 Clash 至少可以先启动并暴露控制器。
 - 如果你的 Clash 配置实际使用了 GeoIP 相关规则或功能，还需要按配置要求准备 `Country.mmdb`。
 - 如需跟随原始上游，也可以改为从 `https://github.com/BackupTime/clash.git` 克隆后再按同样步骤编译。
 

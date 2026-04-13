@@ -12,6 +12,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import quote
+from urllib.parse import urlparse
 
 import httpx
 import yaml
@@ -56,8 +57,41 @@ def _clash_alive() -> bool:
         return False
 
 
+def _controller_address() -> str:
+    parsed = urlparse(config.CLASH_API_BASE)
+    if parsed.netloc:
+        return parsed.netloc
+    return config.CLASH_API_BASE.replace("http://", "").replace("https://", "").strip("/")
+
+
+def _ensure_clash_config_exists() -> None:
+    path = Path(config.CLASH_CONFIG_PATH)
+    if path.exists():
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "mixed-port": config.CLASH_MIXED_PORT,
+        "external-controller": _controller_address(),
+        "mode": "rule",
+        "log-level": "info",
+        "proxies": [],
+        "proxy-groups": [
+            {
+                "name": "GLOBAL",
+                "type": "select",
+                "proxies": ["DIRECT"],
+            }
+        ],
+        "rules": ["MATCH,DIRECT"],
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+
+
 def _start_clash() -> None:
     """启动 Clash 进程（后台、与当前进程脱离），日志写入 logs/clash.log"""
+    _ensure_clash_config_exists()
     CLASH_LOG.parent.mkdir(parents=True, exist_ok=True)
     with open(CLASH_LOG, "a", encoding="utf-8") as logf:
         subprocess.Popen(
