@@ -55,9 +55,13 @@ cp config.sample.json config.json
 7. 准备 Clash 配置文件所在目录：
    例如当 `config.json` 中的 `clash_config_path` 为 `/opt/clash-config/config.yaml` 时，可先执行：
    `sudo mkdir -p /opt/clash-config`
+   如果你把 `clash_config_path` 改成了别的路径，例如 `/data/clash/config.yaml`，那就应创建对应父目录：
+   `sudo mkdir -p /data/clash`
 8. 放置 Clash 配置文件：
-   例如：
+   例如默认路径下：
    `sudo cp config.yaml /opt/clash-config/config.yaml`
+   如果你使用的是自定义路径，则应复制到 `clash_config_path` 指定的位置，例如：
+   `sudo cp config.yaml /data/clash/config.yaml`
 9. 下载 GeoIP 数据库：
    `sudo wget -O /opt/clash-config/Country.mmdb https://github.com/Dreamacro/maxmind-geoip/releases/latest/download/Country.mmdb`
 
