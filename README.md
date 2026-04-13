@@ -24,25 +24,30 @@ cd clash-manager
 
 这台机器上实际采用的方式不是 `apt install`，而是“源码编译 + 软链接接入”：
 
-1. 克隆 Clash 源码：
+1. 安装 Go（该 Clash 仓库的 `go.mod` 当前要求 `go 1.20` 及以上）：
+   `sudo apt update`
+   `sudo apt install -y golang-go make`
+   `go version`
+2. 克隆 Clash 源码：
    `git clone git@github.com:Xenotech-Research/clash.git /home/ubuntu/apps/clash`
-2. 编译 Linux amd64 可执行文件：
+3. 编译 Linux amd64 可执行文件：
    `cd /home/ubuntu/apps/clash && make linux-amd64`
-3. 准备程序入口路径：
+4. 准备程序入口路径：
    `sudo mkdir -p /opt/clash`
-4. 将编译产物软链接到项目默认路径：
+5. 将编译产物软链接到项目默认路径：
    `sudo ln -sf /home/ubuntu/apps/clash/bin/clash-linux-amd64 /opt/clash/clash`
-5. 准备配置目录：
+6. 准备配置目录：
    `sudo mkdir -p /opt/clash-config`
-6. 放置 Clash 配置文件：
+7. 放置 Clash 配置文件：
    `sudo cp config.yaml /opt/clash-config/config.yaml`
-7. 下载 GeoIP 数据库：
+8. 下载 GeoIP 数据库：
    `sudo wget -O /opt/clash-config/Country.mmdb https://github.com/Dreamacro/maxmind-geoip/releases/latest/download/Country.mmdb`
 
 可选检查：
 
 - 查看版本：`/opt/clash/clash -v`
 - 当前机器上的版本示例：`Clash v1.17.0-1-gc7e34bd linux amd64`
+- 查看 Go 版本：`go version`
 
 说明：
 
