@@ -82,10 +82,15 @@ cp config.sample.json config.json
 
 ## 运行
 
-- 后端：`uvicorn server:app --host 0.0.0.0 --port 9988`
-- 前端：仓库在 `web/`，**`cd web && yarn build`** 得到 `web/dist`，nginx 直接指向该目录。
-- 前端开发：`cd web && yarn dev`（会代理 `/api` 到 9988）
-- 生产：`./start.sh` 用 screen 启动后端；nginx 提供静态 `web/dist` 并转发 `/api` 到 9988。
+- 后端开发启动：`uvicorn server:app --host 0.0.0.0 --port 9988`
+- 后端常驻启动：`./start.sh`
+- 正式使用：
+  前端仓库在 `web/`，先执行 `cd web && yarn build` 生成 `web/dist`，再由 nginx 提供静态页面并转发 `/api` 到 `9988`。
+- 临时使用：
+  如果暂时不想配 nginx，可以让后端继续通过 `./start.sh` 在后台常驻，然后单独启动 Vite 前端：
+  `cd web && yarn dev --host 0.0.0.0 --port 5173`
+  `yarn dev` 会自动把 `/api` 代理到 `http://127.0.0.1:9988`，因此它可以临时同时承担“前端页面 + 后端接口转发”的作用。
+  这种方式下，后端端口 `9988` 不需要公网开放；只要 `yarn dev` 所在端口能被公网访问即可。
 
 ## 配置
 
