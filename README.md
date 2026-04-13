@@ -62,10 +62,6 @@ cp config.sample.json config.json
    `sudo cp config.yaml /opt/clash-config/config.yaml`
    如果你使用的是自定义路径，则应复制到 `clash_config_path` 指定的位置，例如：
    `sudo cp config.yaml /data/clash/config.yaml`
-9. 按需准备 GeoIP 数据库：
-   只有当你的 Clash 配置中实际使用了 GeoIP 相关规则或功能时，才需要准备 `Country.mmdb`。
-   例如默认路径下可执行：
-   `sudo wget -O /opt/clash-config/Country.mmdb https://github.com/Dreamacro/maxmind-geoip/releases/latest/download/Country.mmdb`
 
 可选检查：
 
@@ -80,6 +76,7 @@ cp config.sample.json config.json
 - `/opt/clash/clash` 可以是真实文件，也可以像当前机器一样是一个软链接。
 - 只要 `config.json` 中的 `clash_bin` 指向一个可执行的 Clash 内核即可，不要求必须安装在 `/opt/clash/`。
 - `config.yaml` 需要与本项目配置一致，至少应保证 `external-controller: 127.0.0.1:9090`，并让代理端口与 `clash_mixed_port` 对应。
+- 如果你的 Clash 配置实际使用了 GeoIP 相关规则或功能，还需要按配置要求准备 `Country.mmdb`。
 - 如需跟随原始上游，也可以改为从 `https://github.com/BackupTime/clash.git` 克隆后再按同样步骤编译。
 
 ## 运行
