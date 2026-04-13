@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+logs/
+web/node_modules/
+web/dist/
+
+subscriptions.json
+current_subscription_id.json
+
+.env
+.codex
