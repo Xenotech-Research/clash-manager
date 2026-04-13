@@ -81,6 +81,8 @@ cp config.sample.json config.json
 
 ## 运行
 
+- 安装后端依赖：`pip install -r requirements.txt`
+- 安装前端依赖：`cd web && yarn install`
 - 后端开发启动：`uvicorn server:app --host 0.0.0.0 --port 9988`
 - 后端常驻启动：`./start.sh`
 - 正式使用：
