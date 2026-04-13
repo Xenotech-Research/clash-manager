@@ -1,0 +1,7 @@
+{
+  "clash_api_base": "http://127.0.0.1:9090",
+  "clash_mixed_port": 7890,
+  "clash_config_path": "/opt/clash-config/config.yaml",
+  "clash_bin": "/opt/clash/clash",
+  "sub_converter_api": "https://api.dler.io/sub"
+}
