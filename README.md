@@ -48,16 +48,16 @@ cp config.sample.json config.json
    `clash_mixed_port`
 5. 选择一种接入方式：
    方式 A：保持默认值，准备 `/opt/clash/clash`，可以是真实文件，也可以是软链接。
-   方式 B：不使用 `/opt/clash/clash`，直接把 `config.json` 里的 `clash_bin` 改成你的实际路径。
-6. 若你选择方式 A，可像当前机器一样创建软链接：
+   如果你选择方式 A，可像当前机器一样创建软链接：
    `sudo mkdir -p /opt/clash`
    `sudo ln -sf /home/ubuntu/apps/clash/bin/clash-linux-amd64 /opt/clash/clash`
-7. 准备 Clash 配置文件所在目录：
+   方式 B：不使用 `/opt/clash/clash`，直接把 `config.json` 里的 `clash_bin` 改成你的实际路径。
+6. 准备 Clash 配置文件所在目录：
    例如当 `config.json` 中的 `clash_config_path` 为 `/opt/clash-config/config.yaml` 时，可先执行：
    `sudo mkdir -p /opt/clash-config`
    如果你把 `clash_config_path` 改成了别的路径，例如 `/data/clash/config.yaml`，那就应创建对应父目录：
    `sudo mkdir -p /data/clash`
-8. 放置 Clash 配置文件：
+7. 放置 Clash 配置文件：
    例如默认路径下：
    `sudo cp config.yaml /opt/clash-config/config.yaml`
    如果你使用的是自定义路径，则应复制到 `clash_config_path` 指定的位置，例如：
