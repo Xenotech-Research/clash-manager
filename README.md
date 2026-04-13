@@ -9,7 +9,7 @@ git clone git@github.com:Xenotech-Research/clash-manager.git
 cd clash-manager
 ```
 
-仓库提供 `config.sample.json` 作为模板；首次使用时，请先复制为 `config.json`，再按你的机器环境修改其中路径。
+仓库提供 `config.sample.json` 作为模板；首次使用时，请先复制为 `config.json`，再按你的机器环境修改其中路径。`config.json` 不需要把每个字段都重新写一遍，只放你想覆盖的项即可。
 
 ## 功能
 
@@ -26,7 +26,7 @@ cd clash-manager
 cp config.sample.json config.json
 ```
 
-`config.sample.json` 中提供了推荐字段，复制后再按你的机器情况调整。示例值如下：
+`config.sample.json` 中提供了完整的推荐字段；`config.json` 会在启动时覆盖这些默认值。示例值如下：
 
 - `CLASH_BIN=/opt/clash/clash`
 - `CLASH_CONFIG_PATH=/opt/clash-config/config.yaml`
@@ -41,7 +41,7 @@ cp config.sample.json config.json
    `git clone git@github.com:Xenotech-Research/clash.git /home/ubuntu/apps/clash`
 3. 编译 Linux amd64 可执行文件：
    `cd /home/ubuntu/apps/clash && make linux-amd64`
-4. 修改项目根目录的 `config.json`，至少确认这些字段符合你的机器实际情况：
+4. 修改项目根目录的 `config.json`，按需覆盖与你机器相关的字段，例如：
    `clash_bin`
    `clash_config_path`
    `clash_api_base`
@@ -68,7 +68,7 @@ cp config.sample.json config.json
 - 查看版本：`$CLASH_BIN -v` 或直接执行你的 Clash 二进制路径
 - 当前机器上的版本示例：`Clash v1.17.0-1-gc7e34bd linux amd64`
 - 查看 Go 版本：`go version`
-- 查看当前后端配置：直接打开项目根目录的 `config.json`
+- 查看当前后端配置：先看 `config.sample.json` 默认值，再看 `config.json` 中你覆盖了哪些字段
 - 若缺少 `config.json`：从 `config.sample.json` 复制一份后再启动后端
 
 说明：
@@ -95,7 +95,7 @@ cp config.sample.json config.json
 
 ## 配置
 
-推荐直接编辑项目根目录的 `config.json`：
+推荐通过 `config.sample.json` + `config.json` 的方式管理配置：
 
 - `clash_api_base`：Clash 控制器地址，默认 `http://127.0.0.1:9090`
 - `clash_mixed_port`：Clash 混合代理端口（HTTP/SOCKS 同一端口），默认 `7890`
@@ -103,7 +103,10 @@ cp config.sample.json config.json
 - `clash_bin`：Clash 可执行文件路径，默认 `/opt/clash/clash`
 - `sub_converter_api`：订阅转 Clash 的 API，默认 `https://api.dler.io/sub`
 
-仓库中提交的是 `config.sample.json`；`config.json` 用于本机部署，不纳入版本控制。
+其中：
+
+- `config.sample.json`：仓库内的完整默认模板
+- `config.json`：本机部署覆盖项，不纳入版本控制
 
 ## 其他程序使用本地代理
 

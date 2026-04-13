@@ -6,35 +6,52 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "config.json"
 CONFIG_SAMPLE_FILE = BASE_DIR / "config.sample.json"
 
-REQUIRED_KEYS = {
+REQUIRED_KEYS = (
     "clash_api_base",
     "clash_mixed_port",
     "clash_config_path",
     "clash_bin",
     "sub_converter_api",
-}
+)
+
+
+def _read_json_object(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid JSON in {path}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{path} must contain a JSON object")
+
+    return data
 
 
 def _load_file_config() -> dict:
+    if not CONFIG_SAMPLE_FILE.exists():
+        raise RuntimeError(f"Missing {CONFIG_SAMPLE_FILE}")
+
+    sample_data = _read_json_object(CONFIG_SAMPLE_FILE)
+    missing_in_sample = [key for key in REQUIRED_KEYS if key not in sample_data]
+    if missing_in_sample:
+        raise RuntimeError(
+            f"{CONFIG_SAMPLE_FILE} is missing required keys: {', '.join(missing_in_sample)}"
+        )
+
     if not CONFIG_FILE.exists():
         message = f"Missing {CONFIG_FILE}"
-        if CONFIG_SAMPLE_FILE.exists():
-            message += f". Copy {CONFIG_SAMPLE_FILE.name} to {CONFIG_FILE.name} and adjust it for this machine."
+        message += f". Copy {CONFIG_SAMPLE_FILE.name} to {CONFIG_FILE.name} and adjust it for this machine."
         raise RuntimeError(message)
 
-    try:
-        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Invalid JSON in {CONFIG_FILE}: {exc}") from exc
+    file_data = _read_json_object(CONFIG_FILE)
+    merged = dict(sample_data)
+    merged.update(file_data)
 
-    if not isinstance(data, dict):
-        raise RuntimeError(f"{CONFIG_FILE} must contain a JSON object")
-
-    missing = sorted(REQUIRED_KEYS - set(data))
+    missing = [key for key in REQUIRED_KEYS if key not in merged]
     if missing:
-        raise RuntimeError(f"{CONFIG_FILE} is missing required keys: {', '.join(missing)}")
+        raise RuntimeError(f"Effective config is missing required keys: {', '.join(missing)}")
 
-    return data
+    return merged
 
 
 FILE_CONFIG = _load_file_config()
