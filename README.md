@@ -16,13 +16,13 @@ cd clash-manager
 
 ## Clash 内核安装（前置）
 
-本项目本身不负责安装 Clash 内核；它依赖一份本地可执行文件，并由后端直接启动。当前代码默认使用：
+本项目本身不负责安装 Clash 内核；它依赖一份本地可执行文件，并由后端直接启动。后端会从环境变量读取路径，当前默认值是：
 
 - `CLASH_BIN=/opt/clash/clash`
 - `CLASH_CONFIG_PATH=/opt/clash-config/config.yaml`
 - `CLASH_API_BASE=http://127.0.0.1:9090`
 
-这台机器上实际采用的方式不是 `apt install`，而是“源码编译 + 软链接接入”：
+这台机器上实际采用的方式不是 `apt install`，而是“源码编译 + 后端按路径启动”；其中软链接只是当前机器的一种接入方式，不是必须要求：
 
 1. 先自行安装 Go 和 `make`：
    该 Clash 仓库的 `go.mod` 当前要求 `go 1.20` 及以上，安装完成后可先用 `go version` 确认版本。
@@ -31,9 +31,11 @@ cd clash-manager
    `git clone git@github.com:Xenotech-Research/clash.git /home/ubuntu/apps/clash`
 3. 编译 Linux amd64 可执行文件：
    `cd /home/ubuntu/apps/clash && make linux-amd64`
-4. 准备程序入口路径：
+4. 选择一种接入方式：
+   方式 A：保持默认值，准备 `/opt/clash/clash`，可以是真实文件，也可以是软链接。
+   方式 B：不使用 `/opt/clash/clash`，直接在后端环境变量里设置 `CLASH_BIN=/你的/实际/路径/clash-linux-amd64`。
+5. 若你选择方式 A，可像当前机器一样创建软链接：
    `sudo mkdir -p /opt/clash`
-5. 将编译产物软链接到项目默认路径：
    `sudo ln -sf /home/ubuntu/apps/clash/bin/clash-linux-amd64 /opt/clash/clash`
 6. 准备配置目录：
    `sudo mkdir -p /opt/clash-config`
@@ -44,7 +46,7 @@ cd clash-manager
 
 可选检查：
 
-- 查看版本：`/opt/clash/clash -v`
+ - 查看版本：`$CLASH_BIN -v` 或直接执行你的 Clash 二进制路径
 - 当前机器上的版本示例：`Clash v1.17.0-1-gc7e34bd linux amd64`
 - 查看 Go 版本：`go version`
 
