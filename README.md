@@ -9,7 +9,7 @@ git clone git@github.com:Xenotech-Research/clash-manager.git
 cd clash-manager
 ```
 
-项目根目录自带一个 `config.json`，用于配置 Clash 二进制路径、Clash 配置文件路径、控制器地址等本地部署项。
+仓库提供 `config.sample.json` 作为模板；首次使用时，请先复制为 `config.json`，再按你的机器环境修改其中路径。
 
 ## 功能
 
@@ -18,7 +18,15 @@ cd clash-manager
 
 ## Clash 内核安装（前置）
 
-本项目本身不负责安装 Clash 内核；它依赖一份本地可执行文件，并由后端直接启动。后端默认从项目根目录的 `config.json` 读取配置，当前默认值是：
+本项目本身不负责安装 Clash 内核；它依赖一份本地可执行文件，并由后端直接启动。后端只读取项目根目录的 `config.json`。
+
+开始之前，先执行：
+
+```bash
+cp config.sample.json config.json
+```
+
+`config.sample.json` 中提供了推荐字段，复制后再按你的机器情况调整。示例值如下：
 
 - `CLASH_BIN=/opt/clash/clash`
 - `CLASH_CONFIG_PATH=/opt/clash-config/config.yaml`
@@ -59,12 +67,12 @@ cd clash-manager
 - 当前机器上的版本示例：`Clash v1.17.0-1-gc7e34bd linux amd64`
 - 查看 Go 版本：`go version`
 - 查看当前后端配置：直接打开项目根目录的 `config.json`
+- 若缺少 `config.json`：从 `config.sample.json` 复制一份后再启动后端
 
 说明：
 
 - `/opt/clash/clash` 可以是真实文件，也可以像当前机器一样是一个软链接。
 - 只要 `config.json` 中的 `clash_bin` 指向一个可执行的 Clash 内核即可，不要求必须安装在 `/opt/clash/`。
-- 若你仍然希望通过环境变量注入配置，后端也仍然支持；环境变量会覆盖 `config.json` 中的同名配置。
 - `config.yaml` 需要与本项目配置一致，至少应保证 `external-controller: 127.0.0.1:9090`，并让代理端口与 `clash_mixed_port` 对应。
 - 如需跟随原始上游，也可以改为从 `https://github.com/BackupTime/clash.git` 克隆后再按同样步骤编译。
 
@@ -85,7 +93,7 @@ cd clash-manager
 - `clash_bin`：Clash 可执行文件路径，默认 `/opt/clash/clash`
 - `sub_converter_api`：订阅转 Clash 的 API，默认 `https://api.dler.io/sub`
 
-如果你已有现成的部署方式，也可以继续使用环境变量 `CLASH_API_BASE`、`CLASH_MIXED_PORT`、`CLASH_CONFIG_PATH`、`CLASH_BIN`、`SUB_CONVERTER_API` 覆盖这些配置。
+仓库中提交的是 `config.sample.json`；`config.json` 用于本机部署，不纳入版本控制。
 
 ## 其他程序使用本地代理
 
