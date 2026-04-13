@@ -24,10 +24,8 @@ cd clash-manager
 
 这台机器上实际采用的方式不是 `apt install`，而是“源码编译 + 软链接接入”：
 
-1. 安装 Go（该 Clash 仓库的 `go.mod` 当前要求 `go 1.20` 及以上）：
-   `sudo apt update`
-   `sudo apt install -y golang-go make`
-   `go version`
+1. 先自行安装 Go 和 `make`：
+   该 Clash 仓库的 `go.mod` 当前要求 `go 1.20` 及以上，安装完成后可先用 `go version` 确认版本。
 2. 克隆 Clash 源码：
    `git clone git@github.com:Xenotech-Research/clash.git /home/ubuntu/apps/clash`
 3. 编译 Linux amd64 可执行文件：
