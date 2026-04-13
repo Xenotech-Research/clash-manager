@@ -26,6 +26,7 @@ cd clash-manager
 
 1. 先自行安装 Go 和 `make`：
    该 Clash 仓库的 `go.mod` 当前要求 `go 1.20` 及以上，安装完成后可先用 `go version` 确认版本。
+   此处不固定给出安装命令，是因为不同 Linux 发行版、软件源和机器环境下可获得的 Go 版本差异较大，直接写死命令容易装到过旧版本。
 2. 克隆 Clash 源码：
    `git clone git@github.com:Xenotech-Research/clash.git /home/ubuntu/apps/clash`
 3. 编译 Linux amd64 可执行文件：
