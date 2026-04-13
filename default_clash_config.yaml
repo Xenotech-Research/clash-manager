@@ -1,0 +1,12 @@
+# 自动创建 / 补全 clash配置时使用。mixed-port 与 external-controller 由 server.py 按 config.json 注入。
+allow-lan: false
+mode: rule
+log-level: info
+proxies: []
+proxy-groups:
+  - name: GLOBAL
+    type: select
+    proxies:
+      - DIRECT
+rules:
+  - MATCH,DIRECT

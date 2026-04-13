@@ -7,6 +7,7 @@ Clash 订阅管理 + 节点切换后端
 import asyncio
 import json
 import os
+import signal
 import subprocess
 import time
 from contextlib import asynccontextmanager
@@ -27,6 +28,7 @@ SUBS_FILE = Path(__file__).resolve().parent / "subscriptions.json"
 CURRENT_SUB_FILE = Path(__file__).resolve().parent / "current_subscription_id.json"
 CLASH_LOG = Path(__file__).resolve().parent / "logs" / "clash.log"
 TRAFFIC_LOG_DIR = Path(__file__).resolve().parent / "logs"
+DEFAULT_CLASH_CONFIG_YAML = Path(__file__).resolve().parent / "default_clash_config.yaml"
 
 
 def _get_current_sub_id() -> int | None:
@@ -64,34 +66,71 @@ def _controller_address() -> str:
     return config.CLASH_API_BASE.replace("http://", "").replace("https://", "").strip("/")
 
 
-def _ensure_clash_config_exists() -> None:
-    path = Path(config.CLASH_CONFIG_PATH)
-    if path.exists():
-        return
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    data = {
+def _minimal_clash_yaml() -> dict:
+    """加载 default_clash_config.yaml，并注入 mixed-port / external-controller（与 config.json 一致）。"""
+    if not DEFAULT_CLASH_CONFIG_YAML.is_file():
+        raise RuntimeError(f"Missing {DEFAULT_CLASH_CONFIG_YAML}")
+    with open(DEFAULT_CLASH_CONFIG_YAML, encoding="utf-8") as f:
+        loaded = yaml.safe_load(f)
+    if not isinstance(loaded, dict):
+        raise RuntimeError(f"{DEFAULT_CLASH_CONFIG_YAML} must be a YAML mapping")
+    out = {
         "mixed-port": config.CLASH_MIXED_PORT,
         "external-controller": _controller_address(),
-        "mode": "rule",
-        "log-level": "info",
-        "proxies": [],
-        "proxy-groups": [
-            {
-                "name": "GLOBAL",
-                "type": "select",
-                "proxies": ["DIRECT"],
-            }
-        ],
-        "rules": ["MATCH,DIRECT"],
     }
-    with open(path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+    out.update(loaded)
+    return out
+
+
+def _ensure_clash_config() -> None:
+    """新建或修正 clash配置文件：缺文件则写最小配置；已存在则对齐控制器与端口，补全残缺结构。"""
+    path = Path(config.CLASH_CONFIG_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    controller = _controller_address()
+    port = config.CLASH_MIXED_PORT
+    minimal = _minimal_clash_yaml()
+
+    if not path.exists():
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(minimal, f, allow_unicode=True, sort_keys=False)
+        return
+
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = yaml.safe_load(raw) if raw.strip() else None
+    except Exception:
+        data = None
+    if not isinstance(data, dict):
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(minimal, f, allow_unicode=True, sort_keys=False)
+        return
+
+    changed = False
+    if data.get("external-controller") != controller:
+        data["external-controller"] = controller
+        changed = True
+    if data.get("mixed-port") != port:
+        data["mixed-port"] = port
+        changed = True
+    if "allow-lan" not in data:
+        data["allow-lan"] = False
+        changed = True
+    if not data.get("proxy-groups") and not data.get("proxy_groups"):
+        data.setdefault("proxies", [])
+        data["proxy-groups"] = minimal["proxy-groups"]
+        data.setdefault("rules", ["MATCH,DIRECT"])
+        data.setdefault("mode", "rule")
+        data.setdefault("log-level", "info")
+        changed = True
+
+    if changed:
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
 
 
 def _start_clash() -> None:
     """启动 Clash 进程（后台、与当前进程脱离），日志写入 logs/clash.log"""
-    _ensure_clash_config_exists()
+    _ensure_clash_config()
     CLASH_LOG.parent.mkdir(parents=True, exist_ok=True)
     with open(CLASH_LOG, "a", encoding="utf-8") as logf:
         subprocess.Popen(
@@ -477,16 +516,66 @@ def _stop_clash() -> bool:
         return False
 
 
+def _pids_listening_on_tcp_port(port: int) -> list[int]:
+    """返回监听指定 TCP 端口的 PID 列表（依赖 lsof，无则返回空）。"""
+    try:
+        proc = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-t"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    if proc.returncode != 0 or not (proc.stdout or "").strip():
+        return []
+    out: list[int] = []
+    for line in proc.stdout.strip().splitlines():
+        try:
+            out.append(int(line.strip()))
+        except ValueError:
+            continue
+    return out
+
+
+def _kill_listeners_on_tcp_port(port: int) -> None:
+    """结束所有占用该 TCP 监听端口的进程（用于释放 mixed-port，避免 address already in use）。"""
+    p = int(port)
+    try:
+        subprocess.run(
+            ["fuser", "-k", f"{p}/tcp"],
+            capture_output=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    for pid in _pids_listening_on_tcp_port(p):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
+    time.sleep(0.4)
+    for pid in _pids_listening_on_tcp_port(p):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+
+
 @app.post("/api/clash/start-or-restart")
 def clash_start_or_restart():
     """
     若 Clash 未运行则启动，若已运行则先终止再启动。
+    启动前会释放 CLASH_MIXED_PORT上已有监听，避免端口占用。
     返回 action: "started" | "restarted"
     """
     was_alive = _clash_alive()
     if was_alive:
         _stop_clash()
         time.sleep(2)
+    _kill_listeners_on_tcp_port(config.CLASH_MIXED_PORT)
+    time.sleep(0.5)
     _start_clash()
     time.sleep(2)
     return {"ok": True, "action": "restarted" if was_alive else "started"}
