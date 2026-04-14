@@ -6,15 +6,15 @@ const API = '/api'
 type Subscription = { id: number; url: string; name: string }
 
 type ProxyItem = { name: string; type: string; now?: string; all?: string[] }
-type ProxiesRes = { proxies: Record<string, ProxyItem> }
+type ProxiesRes = { proxies: Record<string, ProxyItem>; clash_available?: boolean }
 
-type Tab = 'subs' | 'nodes' | 'test' | 'traffic'
+type Tab = 'subs' | 'nodes' | 'test' | 'traffic' | 'settings'
 const TAB_STORAGE_KEY = 'clash-manager-tab'
 
 function getInitialTab(): Tab {
   try {
     const saved = localStorage.getItem(TAB_STORAGE_KEY)
-    if (saved === 'subs' || saved === 'nodes' || saved === 'test' || saved === 'traffic') return saved
+    if (saved === 'subs' || saved === 'nodes' || saved === 'test' || saved === 'traffic' || saved === 'settings') return saved
   } catch (_) {}
   return 'subs'
 }
@@ -39,7 +39,16 @@ type ConnectionsRes = {
   uploadTotal: number
   downloadTotal: number
   connections: Connection[]
+  clash_available?: boolean
 }
+
+type RuntimeConfig = {
+  mixed_port: number
+  allow_lan: boolean
+  bind_address: string
+}
+
+type AccessScope = 'local_only' | 'lan'
 
 function formatBytes(n: number): string {
   if (n >= 1024 * 1024 * 1024) return (n / (1024 * 1024 * 1024)).toFixed(2) + ' GB'
@@ -91,6 +100,27 @@ const MODE_LABELS: { value: ClashMode; label: string }[] = [
   { value: 'script', label: 'Script' },
 ]
 
+async function copyText(text: string): Promise<boolean> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text)
+    return true
+  }
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.setAttribute('readonly', 'true')
+  textarea.style.position = 'fixed'
+  textarea.style.opacity = '0'
+  textarea.style.pointerEvents = 'none'
+  document.body.appendChild(textarea)
+  textarea.select()
+  textarea.setSelectionRange(0, textarea.value.length)
+  try {
+    return document.execCommand('copy')
+  } finally {
+    document.body.removeChild(textarea)
+  }
+}
+
 function App() {
   const [tab, setTab] = useState<Tab>(getInitialTab)
   const [subs, setSubs] = useState<Subscription[]>([])
@@ -103,8 +133,9 @@ function App() {
   const [clashOk, setClashOk] = useState<boolean | null>(null)
   const [loading, setLoading] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [delayTesting, setDelayTesting] = useState<string | null>(null)
+  const [delayTestingNodes, setDelayTestingNodes] = useState<Record<string, boolean>>({})
   const [delayResult, setDelayResult] = useState<Record<string, number>>({})
+  const [bulkDelayTesting, setBulkDelayTesting] = useState(false)
   const [testLoading, setTestLoading] = useState(false)
   const [testState, setTestState] = useState<TestState>(getInitialTestState)
   const [proxyInfo, setProxyInfo] = useState<{ proxy_url: string; proxy_port: number } | null>(null)
@@ -112,7 +143,23 @@ function App() {
   const [trafficSpeed, setTrafficSpeed] = useState<{ upload: number; download: number }>({ upload: 0, download: 0 })
   const [proxyClients, setProxyClients] = useState<{ pid: number; name: string; cmdline: string }[]>([])
   const [restarting, setRestarting] = useState(false)
+  const [runtimeConfig, setRuntimeConfig] = useState<RuntimeConfig | null>(null)
+  const [runtimeConfigDraft, setRuntimeConfigDraft] = useState<RuntimeConfig | null>(null)
+  const [settingsLoading, setSettingsLoading] = useState(false)
+  const [saveAndRestart, setSaveAndRestart] = useState(true)
+  const [settingsMessage, setSettingsMessage] = useState<string | null>(null)
+  const [toast, setToast] = useState<{ type: 'success' | 'error'; message: string } | null>(null)
   const trafficPrevRef = useRef<{ uploadTotal: number; downloadTotal: number; ts: number } | null>(null)
+
+  const hasRuntimeConfigChanges = !!(
+    runtimeConfig &&
+    runtimeConfigDraft &&
+    (
+      runtimeConfig.mixed_port !== runtimeConfigDraft.mixed_port ||
+      runtimeConfig.allow_lan !== runtimeConfigDraft.allow_lan ||
+      runtimeConfig.bind_address !== runtimeConfigDraft.bind_address
+    )
+  )
 
   const fetchSubs = async () => {
     const r = await fetch(`${API}/subscriptions`)
@@ -130,17 +177,25 @@ function App() {
   const fetchProxies = async () => {
     const r = await fetch(`${API}/clash/proxies`)
     if (!r.ok) throw new Error(r.statusText)
-    setProxies(await r.json())
+    const data: ProxiesRes = await r.json()
+    if (data.clash_available === false) {
+      setProxies(null)
+      return false
+    }
+    setProxies(data)
+    return true
   }
 
   const fetchConfigs = async () => {
     const r = await fetch(`${API}/clash/configs`)
     if (!r.ok) return
     const data = await r.json()
+    if (data.clash_available === false) return false
     const mode = data.mode
     if (mode === 'global' || mode === 'rule' || mode === 'direct' || mode === 'script') {
       setClashMode(mode)
     }
+    return true
   }
 
   const fetchGlobalGroupName = async () => {
@@ -154,12 +209,65 @@ function App() {
     const r = await fetch(`${API}/health`)
     const data = await r.json()
     setClashOk(data.clash_reachable ?? false)
+    return !!data.clash_reachable
+  }
+
+  const fetchRuntimeConfig = async () => {
+    const r = await fetch(`${API}/clash/runtime-config`)
+    if (!r.ok) throw new Error(r.statusText)
+    const data: RuntimeConfig = await r.json()
+    setRuntimeConfig(data)
+    setRuntimeConfigDraft(data)
+  }
+
+  const waitForClashReady = async (timeoutMs = 60000, intervalMs = 1000) => {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const ok = await checkHealth().catch(() => false)
+      if (ok) {
+        await Promise.all([
+          fetchProxies().catch(() => false),
+          fetchConfigs().catch(() => false),
+          fetchGlobalGroupName().catch(() => null),
+          fetchRuntimeConfig().catch(() => null),
+        ])
+        return true
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, intervalMs))
+    }
+    return false
+  }
+
+  const getAccessScope = (cfg: RuntimeConfig | null): AccessScope => {
+    if (!cfg) return 'local_only'
+    if (!cfg.allow_lan && cfg.bind_address === '127.0.0.1') return 'local_only'
+    if (cfg.allow_lan && cfg.bind_address === '0.0.0.0') return 'lan'
+    return 'lan'
+  }
+
+  const applyAccessScope = (scope: AccessScope) => {
+    setRuntimeConfigDraft((prev) => {
+      if (!prev) return prev
+      if (scope === 'local_only') {
+        return {
+          ...prev,
+          allow_lan: false,
+          bind_address: '127.0.0.1',
+        }
+      }
+      return {
+        ...prev,
+        allow_lan: true,
+        bind_address: '0.0.0.0',
+      }
+    })
   }
 
   useEffect(() => {
     fetchSubs().catch(console.error)
     fetchCurrentSub().catch(console.error)
     checkHealth().catch(console.error)
+    fetchRuntimeConfig().catch(console.error)
   }, [])
 
   useEffect(() => {
@@ -169,7 +277,13 @@ function App() {
   }, [tab])
 
   useEffect(() => {
-    if (clashOk) {
+    if (!toast) return
+    const timer = window.setTimeout(() => setToast(null), 1800)
+    return () => window.clearTimeout(timer)
+  }, [toast])
+
+  useEffect(() => {
+    if (clashOk && !restarting) {
       fetchProxies().catch(console.error)
       fetchConfigs().catch(console.error)
       fetchGlobalGroupName().catch(console.error)
@@ -184,11 +298,11 @@ function App() {
       setTrafficSpeed({ upload: 0, download: 0 })
       trafficPrevRef.current = null
     }
-  }, [clashOk])
+  }, [clashOk, restarting])
 
   // 每 2 秒拉取连接列表、代理客户端，并计算实时速率
   useEffect(() => {
-    if (!clashOk) return
+    if (!clashOk || restarting) return
     const tick = async () => {
       try {
         const [connR, clientsR] = await Promise.all([
@@ -197,6 +311,14 @@ function App() {
         ])
         if (connR.ok) {
           const data: ConnectionsRes = await connR.json()
+          if (data.clash_available === false) {
+            setConnections(null)
+            setProxyClients([])
+            setTrafficSpeed({ upload: 0, download: 0 })
+            trafficPrevRef.current = null
+            setClashOk(false)
+            return
+          }
           setConnections(data)
           const now = Date.now() / 1000
           const prev = trafficPrevRef.current
@@ -224,7 +346,7 @@ function App() {
     tick()
     const interval = setInterval(tick, 2000)
     return () => clearInterval(interval)
-  }, [clashOk])
+  }, [clashOk, restarting])
 
   const addSub = async () => {
     if (!subUrl.trim()) return
@@ -253,8 +375,8 @@ function App() {
     try {
       const r = await fetch(`${API}/subscriptions/${id}/apply`, { method: 'POST' })
       if (!r.ok) throw new Error((await r.json()).detail ?? r.statusText)
-      await fetchProxies()
       await checkHealth()
+      await fetchProxies()
       await fetchCurrentSub()
       await fetchGlobalGroupName()
     } catch (e) {
@@ -358,13 +480,18 @@ function App() {
   const startOrRestartClash = async () => {
     setError(null)
     setRestarting(true)
+    setClashOk(false)
+    setProxies(null)
+    setConnections(null)
+    setProxyClients([])
+    setTrafficSpeed({ upload: 0, download: 0 })
+    trafficPrevRef.current = null
     try {
       const r = await fetch(`${API}/clash/start-or-restart`, { method: 'POST' })
       if (!r.ok) throw new Error('操作失败')
-      await checkHealth()
-      await fetchProxies().catch(() => {})
-      await fetchConfigs().catch(() => {})
-      await fetchGlobalGroupName().catch(() => {})
+      const ready = await waitForClashReady()
+      if (!ready) throw new Error('Clash 重启后长时间未恢复')
+      setToast({ type: 'success', message: 'Clash 已恢复' })
     } catch (e) {
       setError(e instanceof Error ? e.message : '启动/重启失败')
     } finally {
@@ -372,21 +499,102 @@ function App() {
     }
   }
 
+  const saveRuntimeConfig = async () => {
+    if (!runtimeConfigDraft) return
+    setError(null)
+    setSettingsMessage(null)
+    setSettingsLoading(true)
+    try {
+      const payload = {
+        mixed_port: Number(runtimeConfigDraft.mixed_port),
+        allow_lan: runtimeConfigDraft.allow_lan,
+        bind_address: runtimeConfigDraft.bind_address.trim(),
+      }
+      const r = await fetch(`${API}/clash/runtime-config`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      if (!r.ok) throw new Error((await r.json()).detail ?? r.statusText)
+      const data = await r.json()
+      setRuntimeConfig(data.runtime_config)
+      setRuntimeConfigDraft(data.runtime_config)
+      if (saveAndRestart && data.requires_restart) {
+        setRestarting(true)
+        setClashOk(false)
+        setProxies(null)
+        setConnections(null)
+        setProxyClients([])
+        setTrafficSpeed({ upload: 0, download: 0 })
+        trafficPrevRef.current = null
+        const restartResp = await fetch(`${API}/clash/start-or-restart`, { method: 'POST' })
+        if (!restartResp.ok) throw new Error('配置已保存，但重启 Clash 失败')
+        const ready = await waitForClashReady()
+        if (!ready) throw new Error('配置已保存，但 Clash 重启后长时间未恢复')
+        setSettingsMessage('运行时配置已保存，并已重启 Clash。')
+      } else {
+        if (data.requires_restart) {
+          setSettingsMessage('运行时配置已保存。变更需要重启 Clash 后生效。')
+        } else {
+          setSettingsMessage('运行时配置已保存。')
+        }
+        await fetchRuntimeConfig().catch(() => {})
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '保存运行时配置失败')
+    } finally {
+      setRestarting(false)
+      setSettingsLoading(false)
+    }
+  }
+
   const testDelay = async (nodeName: string) => {
-    setDelayTesting(nodeName)
+    setDelayTestingNodes((prev) => ({ ...prev, [nodeName]: true }))
     try {
       const r = await fetch(
         `${API}/clash/proxies/${encodeURIComponent(nodeName)}/delay?timeout=5000`
       )
       if (!r.ok) throw new Error('测速失败')
       const data = await r.json()
+      if (data.clash_available === false) {
+        setToast({ type: 'error', message: 'Clash 尚未启动，暂时无法测速' })
+        return
+      }
       const ms =
         typeof data.delay === 'number' && data.delay >= 0 ? data.delay : -1
       setDelayResult((prev) => ({ ...prev, [nodeName]: ms }))
     } catch {
       setDelayResult((prev) => ({ ...prev, [nodeName]: -1 }))
     } finally {
-      setDelayTesting(null)
+      setDelayTestingNodes((prev) => {
+        const next = { ...prev }
+        delete next[nodeName]
+        return next
+      })
+    }
+  }
+
+  const testAllDelays = async () => {
+    const allNodeNames = Array.from(new Set(
+      displayGroups.flatMap(([_, p]) => p.all ?? [])
+    ))
+    if (allNodeNames.length === 0) return
+    setError(null)
+    setBulkDelayTesting(true)
+    const concurrency = 4
+    let index = 0
+    const workers = Array.from({ length: Math.min(concurrency, allNodeNames.length) }, async () => {
+      while (index < allNodeNames.length) {
+        const currentIndex = index
+        index += 1
+        const nodeName = allNodeNames[currentIndex]
+        await testDelay(nodeName)
+      }
+    })
+    try {
+      await Promise.all(workers)
+    } finally {
+      setBulkDelayTesting(false)
     }
   }
 
@@ -466,10 +674,17 @@ function App() {
           >
             测试
           </button>
+          <button
+            type="button"
+            className={tab === 'settings' ? 'active' : ''}
+            onClick={() => setTab('settings')}
+          >
+            运行设置
+          </button>
         </nav>
         <div className="sidebar-status">
-          <span className={`status-dot ${clashOk ? 'connected' : ''}`} />
-          {clashOk ? 'Connected' : 'Disconnected'}
+          <span className={`status-dot ${restarting ? 'restarting' : clashOk ? 'connected' : ''}`} />
+          {restarting ? 'Restarting' : clashOk ? 'Connected' : 'Disconnected'}
           <button
             type="button"
             className="sidebar-restart-btn"
@@ -488,8 +703,17 @@ function App() {
                 type="button"
                 className="sidebar-proxy-copy"
                 title="复制代理地址"
-                onClick={() => {
-                  navigator.clipboard.writeText(proxyInfo.proxy_url)
+                onClick={async () => {
+                  try {
+                    const ok = await copyText(proxyInfo.proxy_url)
+                    if (!ok) {
+                      setToast({ type: 'error', message: '复制失败，请手动复制' })
+                      return
+                    }
+                    setToast({ type: 'success', message: '代理地址已复制' })
+                  } catch {
+                    setToast({ type: 'error', message: '复制失败，请手动复制' })
+                  }
                 }}
               >
                 复制
@@ -502,9 +726,18 @@ function App() {
               type="button"
               className="sidebar-proxy-env"
               title="复制环境变量（终端 / 开发工具用）"
-              onClick={() => {
+              onClick={async () => {
                 const env = `export HTTP_PROXY=${proxyInfo.proxy_url} HTTPS_PROXY=${proxyInfo.proxy_url}`
-                navigator.clipboard.writeText(env)
+                try {
+                  const ok = await copyText(env)
+                  if (!ok) {
+                    setToast({ type: 'error', message: '复制失败，请手动复制' })
+                    return
+                  }
+                  setToast({ type: 'success', message: '环境变量已复制' })
+                } catch {
+                  setToast({ type: 'error', message: '复制失败，请手动复制' })
+                }
               }}
             >
               复制环境变量
@@ -514,6 +747,11 @@ function App() {
       </aside>
 
       <main className="main">
+        {toast && (
+          <div className={`toast ${toast.type}`}>
+            {toast.message}
+          </div>
+        )}
         {error && <p className="error">{error}</p>}
         <div className="main-content">
         {tab === 'subs' && (
@@ -571,21 +809,34 @@ function App() {
         )}
 
         {tab === 'nodes' && (
-          <div className="tab-page">
+          <div className="tab-page nodes-page">
             <h1 className="main-title">Proxies</h1>
-            <div className="mode-tabs" style={{ flexShrink: 0 }}>
-              {MODE_LABELS.map(({ value, label }) => (
+            <div className="proxy-header">
+              <div className="mode-tabs">
+                {MODE_LABELS.map(({ value, label }) => (
+                  <button
+                    key={value}
+                    type="button"
+                    className={`mode-tab ${clashMode === value ? 'active' : ''}`}
+                    onClick={() => setMode(value)}
+                    disabled={!clashOk || restarting}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <div className="proxy-toolbar">
                 <button
-                  key={value}
                   type="button"
-                  className={`mode-tab ${clashMode === value ? 'active' : ''}`}
-                  onClick={() => setMode(value)}
+                  className="proxy-batch-delay"
+                  onClick={testAllDelays}
+                  disabled={!clashOk || bulkDelayTesting || displayGroups.length === 0}
                 >
-                  {label}
+                  {bulkDelayTesting ? '全部测速中…' : '全部测速'}
                 </button>
-              ))}
+              </div>
             </div>
-            <div className="tab-body">
+            <div className="tab-body nodes-body">
             {displayGroups.length === 0 && directProxies.length === 0 && clashOk && (
               <p className="empty">
                 {clashMode === 'direct'
@@ -613,9 +864,12 @@ function App() {
                         role="button"
                         tabIndex={0}
                         className={`proxy-card ${isSelected ? 'selected' : ''}`}
-                        onClick={() => selectProxy(groupName, nodeName)}
+                        onClick={() => {
+                          if (!clashOk || restarting) return
+                          selectProxy(groupName, nodeName)
+                        }}
                         onKeyDown={(e) =>
-                          e.key === 'Enter' && selectProxy(groupName, nodeName)
+                          e.key === 'Enter' && clashOk && !restarting && selectProxy(groupName, nodeName)
                         }
                       >
                         <div className="proxy-card-info">
@@ -624,7 +878,7 @@ function App() {
                         </div>
                         <div className="proxy-card-actions">
                           {delay !== undefined && (
-                            <span className="proxy-card-delay">
+                            <span className={`proxy-card-delay ${delay === -1 ? 'timeout' : ''}`}>
                               {delay === -1 ? '超时' : `${delay} ms`}
                             </span>
                           )}
@@ -635,9 +889,9 @@ function App() {
                               e.stopPropagation()
                               testDelay(nodeName)
                             }}
-                            disabled={delayTesting === nodeName}
+                            disabled={!clashOk || restarting || !!delayTestingNodes[nodeName]}
                           >
-                            {delayTesting === nodeName ? '…' : '延迟'}
+                            {delayTestingNodes[nodeName] ? '…' : '延迟'}
                           </button>
                         </div>
                       </div>
@@ -661,6 +915,102 @@ function App() {
                 </div>
               </section>
             )}
+            </div>
+          </div>
+        )}
+
+        {tab === 'settings' && (
+          <div className="tab-page">
+            <h1 className="main-title">Runtime Settings</h1>
+            <div className="tab-body">
+              <section className="settings-panel">
+                <p className="settings-desc">
+                  这里修改的是写入 `config.yaml` 的运行时参数，不属于 `config.json` 的部署静态配置。
+                </p>
+                {settingsMessage && <p className="settings-message">{settingsMessage}</p>}
+                {runtimeConfigDraft && (
+                  <div className="settings-form">
+                    <label className="settings-field">
+                      <span>Mixed Port</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={65535}
+                        value={runtimeConfigDraft.mixed_port}
+                        onChange={(e) =>
+                          setRuntimeConfigDraft((prev) => prev ? {
+                            ...prev,
+                            mixed_port: Number(e.target.value),
+                          } : prev)
+                        }
+                      />
+                    </label>
+                    <div className="settings-field">
+                      <span>访问范围</span>
+                      <div className="settings-scope-options">
+                        <label className="settings-scope-option">
+                          <input
+                            type="radio"
+                            name="access-scope"
+                            checked={getAccessScope(runtimeConfigDraft) === 'local_only'}
+                            onChange={() => applyAccessScope('local_only')}
+                          />
+                          <span title="设置为 allow-lan=false，bind-address=127.0.0.1">仅本机</span>
+                        </label>
+                        <label className="settings-scope-option">
+                          <input
+                            type="radio"
+                            name="access-scope"
+                            checked={getAccessScope(runtimeConfigDraft) === 'lan'}
+                            onChange={() => applyAccessScope('lan')}
+                          />
+                          <span title="设置为 allow-lan=true，bind-address=0.0.0.0">开放局域网</span>
+                        </label>
+                      </div>
+                    </div>
+                    <label className="settings-checkbox">
+                      <input
+                        type="checkbox"
+                        checked={saveAndRestart}
+                        onChange={(e) => setSaveAndRestart(e.target.checked)}
+                      />
+                      <span>保存后自动重启 Clash</span>
+                    </label>
+                    {hasRuntimeConfigChanges && (
+                      <p className="settings-dirty">有未保存的运行时配置修改。</p>
+                    )}
+                    {hasRuntimeConfigChanges && (
+                      <div className="settings-actions">
+                        <button
+                          type="button"
+                          onClick={saveRuntimeConfig}
+                          disabled={settingsLoading}
+                        >
+                          {settingsLoading ? '保存中…' : '保存修改'}
+                        </button>
+                        {runtimeConfig && (
+                          <button
+                            type="button"
+                            className="settings-reset"
+                            onClick={() => {
+                              setRuntimeConfigDraft(runtimeConfig)
+                              setSettingsMessage(null)
+                            }}
+                            disabled={settingsLoading}
+                          >
+                            撤销未保存修改
+                          </button>
+                        )}
+                      </div>
+                    )}
+                    {!hasRuntimeConfigChanges && runtimeConfig && (
+                      <div className="settings-clean">
+                        当前运行时配置与已保存内容一致。
+                      </div>
+                    )}
+                  </div>
+                )}
+              </section>
             </div>
           </div>
         )}

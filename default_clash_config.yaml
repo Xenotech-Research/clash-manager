@@ -1,5 +1,7 @@
-# 自动创建 / 补全 clash配置时使用。mixed-port 与 external-controller 由 server.py 按 config.json 注入。
+# 自动创建 / 补全 clash 配置时使用。这里放运行时可修改的默认项；external-controller 由 server.py 按 config.json 注入。
+mixed-port: 7890
 allow-lan: false
+bind-address: 127.0.0.1
 mode: rule
 log-level: info
 proxies: []

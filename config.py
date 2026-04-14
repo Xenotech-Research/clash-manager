@@ -8,7 +8,6 @@ CONFIG_SAMPLE_FILE = BASE_DIR / "config.sample.json"
 
 REQUIRED_KEYS = (
     "clash_api_base",
-    "clash_mixed_port",
     "clash_config_path",
     "clash_bin",
     "sub_converter_api",
@@ -59,9 +58,6 @@ FILE_CONFIG = _load_file_config()
 
 # Clash 控制器 API（与 config.yaml 中 external-controller 一致）
 CLASH_API_BASE = str(FILE_CONFIG["clash_api_base"])
-
-# Clash 混合代理端口（mixed-port，测试请求经此出口）
-CLASH_MIXED_PORT = int(FILE_CONFIG["clash_mixed_port"])
 
 # 当前使用的 Clash 配置文件路径（写入/更新订阅后写到这里）
 CLASH_CONFIG_PATH = str(FILE_CONFIG["clash_config_path"])

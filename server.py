@@ -29,6 +29,7 @@ CURRENT_SUB_FILE = Path(__file__).resolve().parent / "current_subscription_id.js
 CLASH_LOG = Path(__file__).resolve().parent / "logs" / "clash.log"
 TRAFFIC_LOG_DIR = Path(__file__).resolve().parent / "logs"
 DEFAULT_CLASH_CONFIG_YAML = Path(__file__).resolve().parent / "default_clash_config.yaml"
+RUNTIME_STATE_FILE = Path(__file__).resolve().parent / "runtime_state.json"
 
 
 def _get_current_sub_id() -> int | None:
@@ -50,6 +51,31 @@ def _set_current_sub_id(sub_id: int | None) -> None:
         json.dump({"current_id": sub_id}, f)
 
 
+def _load_runtime_state() -> dict:
+    if not RUNTIME_STATE_FILE.exists():
+        return {"selected_proxies": {}}
+    try:
+        with open(RUNTIME_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {"selected_proxies": {}}
+    if not isinstance(data, dict):
+        return {"selected_proxies": {}}
+    selected = data.get("selected_proxies")
+    if not isinstance(selected, dict):
+        data["selected_proxies"] = {}
+    return data
+
+
+def _save_runtime_state(data: dict) -> None:
+    payload = dict(data)
+    selected = payload.get("selected_proxies")
+    if not isinstance(selected, dict):
+        payload["selected_proxies"] = {}
+    with open(RUNTIME_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
 def _clash_alive() -> bool:
     try:
         base = config.CLASH_API_BASE.rstrip("/")
@@ -66,54 +92,121 @@ def _controller_address() -> str:
     return config.CLASH_API_BASE.replace("http://", "").replace("https://", "").strip("/")
 
 
-def _minimal_clash_yaml() -> dict:
-    """加载 default_clash_config.yaml，并注入 mixed-port / external-controller（与 config.json 一致）。"""
+def _default_clash_yaml() -> dict:
+    """加载 default_clash_config.yaml，并注入固定的 external-controller。"""
     if not DEFAULT_CLASH_CONFIG_YAML.is_file():
         raise RuntimeError(f"Missing {DEFAULT_CLASH_CONFIG_YAML}")
     with open(DEFAULT_CLASH_CONFIG_YAML, encoding="utf-8") as f:
         loaded = yaml.safe_load(f)
     if not isinstance(loaded, dict):
         raise RuntimeError(f"{DEFAULT_CLASH_CONFIG_YAML} must be a YAML mapping")
-    out = {
-        "mixed-port": config.CLASH_MIXED_PORT,
-        "external-controller": _controller_address(),
-    }
-    out.update(loaded)
+    out = dict(loaded)
+    out["external-controller"] = _controller_address()
     return out
 
 
-def _ensure_clash_config() -> None:
-    """新建或修正 clash配置文件：缺文件则写最小配置；已存在则对齐控制器与端口，补全残缺结构。"""
-    path = Path(config.CLASH_CONFIG_PATH)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    controller = _controller_address()
-    port = config.CLASH_MIXED_PORT
-    minimal = _minimal_clash_yaml()
-
-    if not path.exists():
-        with open(path, "w", encoding="utf-8") as f:
-            yaml.safe_dump(minimal, f, allow_unicode=True, sort_keys=False)
-        return
-
+def _load_clash_config_yaml(path: Path) -> dict | None:
     try:
         raw = path.read_text(encoding="utf-8")
         data = yaml.safe_load(raw) if raw.strip() else None
     except Exception:
-        data = None
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _effective_clash_yaml() -> dict:
+    path = Path(config.CLASH_CONFIG_PATH)
+    data = _load_clash_config_yaml(path) if path.exists() else None
+    effective = _default_clash_yaml()
+    if isinstance(data, dict):
+        effective.update(data)
+    return effective
+
+
+def _write_clash_yaml(data: dict) -> None:
+    path = Path(config.CLASH_CONFIG_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+
+def _current_mixed_port() -> int:
+    value = _effective_clash_yaml().get("mixed-port", 7890)
+    return int(value)
+
+
+def _proxy_url() -> str:
+    return f"http://127.0.0.1:{_current_mixed_port()}"
+
+
+def _persist_mode_to_yaml(mode: str) -> None:
+    data = _effective_clash_yaml()
+    data["mode"] = mode
+    _write_clash_yaml(data)
+
+
+def _persist_selected_proxy(group_name: str, proxy_name: str) -> None:
+    state = _load_runtime_state()
+    selected = dict(state.get("selected_proxies", {}))
+    selected[group_name] = proxy_name
+    state["selected_proxies"] = selected
+    _save_runtime_state(state)
+
+
+def _restore_persisted_proxy_selections() -> None:
+    state = _load_runtime_state()
+    selected = state.get("selected_proxies", {})
+    if not isinstance(selected, dict) or not selected:
+        return
+    try:
+        proxies_resp = _clash_request("GET", "/proxies")
+        proxies_resp.raise_for_status()
+        proxies = (proxies_resp.json() or {}).get("proxies", {})
+    except Exception:
+        return
+    for group_name, proxy_name in selected.items():
+        group = proxies.get(group_name)
+        if not isinstance(group, dict):
+            continue
+        all_nodes = group.get("all") or []
+        if proxy_name not in all_nodes:
+            continue
+        try:
+            resp = _clash_request("PUT", f"/proxies/{quote(group_name)}", json={"name": proxy_name})
+            resp.raise_for_status()
+        except Exception:
+            continue
+
+
+def _ensure_clash_config() -> None:
+    """新建或修正 clash 配置文件：缺文件则写默认 YAML；已存在则只对齐静态项并补全残缺结构。"""
+    path = Path(config.CLASH_CONFIG_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    minimal = _default_clash_yaml()
+
+    if not path.exists():
+        _write_clash_yaml(minimal)
+        return
+
+    data = _load_clash_config_yaml(path)
     if not isinstance(data, dict):
-        with open(path, "w", encoding="utf-8") as f:
-            yaml.safe_dump(minimal, f, allow_unicode=True, sort_keys=False)
+        _write_clash_yaml(minimal)
         return
 
     changed = False
-    if data.get("external-controller") != controller:
-        data["external-controller"] = controller
+    if data.get("external-controller") != minimal["external-controller"]:
+        data["external-controller"] = minimal["external-controller"]
         changed = True
-    if data.get("mixed-port") != port:
-        data["mixed-port"] = port
+    if "mixed-port" not in data:
+        data["mixed-port"] = minimal.get("mixed-port", 7890)
         changed = True
     if "allow-lan" not in data:
-        data["allow-lan"] = False
+        data["allow-lan"] = minimal.get("allow-lan", False)
+        changed = True
+    if "bind-address" not in data and "bind-address" in minimal:
+        data["bind-address"] = minimal["bind-address"]
         changed = True
     if not data.get("proxy-groups") and not data.get("proxy_groups"):
         data.setdefault("proxies", [])
@@ -124,8 +217,7 @@ def _ensure_clash_config() -> None:
         changed = True
 
     if changed:
-        with open(path, "w", encoding="utf-8") as f:
-            yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+        _write_clash_yaml(data)
 
 
 def _start_clash() -> None:
@@ -150,6 +242,7 @@ async def _clash_keepalive_task():
         if not _clash_alive():
             _start_clash()
             await asyncio.sleep(3)
+            _restore_persisted_proxy_selections()
 
 
 def _write_traffic_snapshot():
@@ -185,6 +278,7 @@ async def lifespan(app: FastAPI):
     if not _clash_alive():
         _start_clash()
         await asyncio.sleep(2)
+    _restore_persisted_proxy_selections()
     # 后台保活 + 流量日志
     keepalive = asyncio.create_task(_clash_keepalive_task())
     traffic_log = asyncio.create_task(_traffic_log_task())
@@ -221,6 +315,12 @@ class SubscriptionUpdate(BaseModel):
     name: str | None = None
 
 
+class RuntimeConfigUpdate(BaseModel):
+    mixed_port: int
+    allow_lan: bool
+    bind_address: str
+
+
 def _load_subs() -> list[dict]:
     if not SUBS_FILE.exists():
         return []
@@ -241,29 +341,96 @@ def _clash_request(method: str, path: str, **kwargs) -> httpx.Response:
         return c.request(method, url, **kwargs)
 
 
+def _clash_unavailable_payload(**extra):
+    payload = {
+        "ok": False,
+        "clash_available": False,
+        "message": "clash_not_ready",
+    }
+    payload.update(extra)
+    return payload
+
+
 @app.get("/api/clash/proxy-info")
 def clash_proxy_info():
     """返回本地 Clash 代理地址，供其他程序/开发工具配置使用（如环境变量、IDE 代理）。"""
     return {
-        "proxy_url": PROXY_URL,
+        "proxy_url": _proxy_url(),
         "proxy_host": "127.0.0.1",
-        "proxy_port": config.CLASH_MIXED_PORT,
+        "proxy_port": _current_mixed_port(),
         "controller": config.CLASH_API_BASE.rstrip("/"),
+    }
+
+
+@app.get("/api/clash/runtime-config")
+def clash_runtime_config():
+    data = _effective_clash_yaml()
+    return {
+        "mixed_port": int(data.get("mixed-port", 7890)),
+        "allow_lan": bool(data.get("allow-lan", False)),
+        "bind_address": str(data.get("bind-address", "127.0.0.1")),
+    }
+
+
+@app.put("/api/clash/runtime-config")
+def update_clash_runtime_config(body: RuntimeConfigUpdate):
+    if body.mixed_port <= 0 or body.mixed_port > 65535:
+        raise HTTPException(status_code=400, detail="端口必须在 1-65535 之间")
+    bind_address = body.bind_address.strip()
+    if not bind_address:
+        raise HTTPException(status_code=400, detail="bind_address 不能为空")
+
+    path = Path(config.CLASH_CONFIG_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = _effective_clash_yaml()
+    changed = (
+        int(data.get("mixed-port", 7890)) != body.mixed_port
+        or bool(data.get("allow-lan", False)) != body.allow_lan
+        or str(data.get("bind-address", "127.0.0.1")) != bind_address
+    )
+    data["external-controller"] = _controller_address()
+    data["mixed-port"] = body.mixed_port
+    data["allow-lan"] = body.allow_lan
+    data["bind-address"] = bind_address
+    path.write_text(
+        yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    return {
+        "ok": True,
+        "runtime_config": {
+            "mixed_port": body.mixed_port,
+            "allow_lan": body.allow_lan,
+            "bind_address": bind_address,
+        },
+        "requires_restart": changed,
     }
 
 
 @app.get("/api/clash/version")
 def clash_version():
-    r = _clash_request("GET", "/version")
-    r.raise_for_status()
-    return r.json() if r.content else {"version": r.text.strip()}
+    try:
+        r = _clash_request("GET", "/version")
+        r.raise_for_status()
+        data = r.json() if r.content else {"version": r.text.strip()}
+        if isinstance(data, dict):
+            data["clash_available"] = True
+        return data
+    except Exception:
+        return _clash_unavailable_payload(version=None)
 
 
 @app.get("/api/clash/configs")
 def clash_configs():
-    r = _clash_request("GET", "/configs")
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = _clash_request("GET", "/configs")
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict):
+            data["clash_available"] = True
+        return data
+    except Exception:
+        return _clash_unavailable_payload(mode=None)
 
 
 @app.get("/api/clash/global-group-name")
@@ -299,6 +466,9 @@ def clash_reload_configs():
 @app.patch("/api/clash/configs")
 def clash_update_configs(body: dict):
     """更新运行中配置（如 mode: global/rule/direct/script），与 CfW 顶部四个标签一致"""
+    mode = body.get("mode")
+    if isinstance(mode, str) and mode in {"global", "rule", "direct", "script"}:
+        _persist_mode_to_yaml(mode)
     r = _clash_request("PATCH", "/configs", json=body)
     r.raise_for_status()
     return r.json() if r.content else {}
@@ -306,32 +476,54 @@ def clash_update_configs(body: dict):
 
 @app.get("/api/clash/proxies")
 def clash_proxies():
-    r = _clash_request("GET", "/proxies")
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = _clash_request("GET", "/proxies")
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict):
+            data["clash_available"] = True
+        return data
+    except Exception:
+        return _clash_unavailable_payload(proxies={})
 
 
 @app.get("/api/clash/proxies/{name}")
 def clash_proxy_detail(name: str):
-    r = _clash_request("GET", f"/proxies/{quote(name)}")
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = _clash_request("GET", f"/proxies/{quote(name)}")
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict):
+            data["clash_available"] = True
+        return data
+    except Exception:
+        return _clash_unavailable_payload(name=name)
 
 
 @app.get("/api/clash/proxies/{name}/delay")
 def clash_proxy_delay(name: str, url: str = "http://www.gstatic.com/generate_204", timeout: int = 5000):
     """测速：返回该节点的延迟 ms"""
-    path = f"/proxies/{quote(name)}/delay?url={quote(url)}&timeout={timeout}"
-    r = _clash_request("GET", path)
-    r.raise_for_status()
-    data = r.json() if r.content else {}
-    delay = data.get("delay") if isinstance(data, dict) else data
-    return {"delay": delay} if isinstance(delay, (int, float)) else {"delay": None}
+    try:
+        path = f"/proxies/{quote(name)}/delay?url={quote(url)}&timeout={timeout}"
+        r = _clash_request("GET", path)
+        r.raise_for_status()
+        data = r.json() if r.content else {}
+        delay = data.get("delay") if isinstance(data, dict) else data
+        return {
+            "delay": delay if isinstance(delay, (int, float)) else None,
+            "clash_available": True,
+        }
+    except Exception:
+        return _clash_unavailable_payload(delay=None)
 
 
 @app.put("/api/clash/proxies/{group_name}")
 def clash_select_proxy(group_name: str, body: dict):
     """选择某个代理组使用的节点。body: {"name": "节点名称"}"""
+    proxy_name = body.get("name")
+    if not isinstance(proxy_name, str) or not proxy_name:
+        raise HTTPException(status_code=400, detail="缺少代理节点名称")
+    _persist_selected_proxy(group_name, proxy_name)
     r = _clash_request("PUT", f"/proxies/{quote(group_name)}", json=body)
     r.raise_for_status()
     if r.status_code == 204 or not r.content:
@@ -341,24 +533,36 @@ def clash_select_proxy(group_name: str, body: dict):
 
 @app.get("/api/clash/rules")
 def clash_rules():
-    r = _clash_request("GET", "/rules")
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = _clash_request("GET", "/rules")
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict):
+            data["clash_available"] = True
+        return data
+    except Exception:
+        return _clash_unavailable_payload(rules=[])
 
 
 @app.get("/api/clash/connections")
 def clash_connections():
     """Clash 当前连接列表：含每条连接的 host/dest、进程路径、上下行字节，用于流量统计与展示。"""
-    r = _clash_request("GET", "/connections")
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = _clash_request("GET", "/connections")
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict):
+            data["clash_available"] = True
+        return data
+    except Exception:
+        return _clash_unavailable_payload(uploadTotal=0, downloadTotal=0, connections=[])
 
 
 def _get_proxy_clients() -> list[dict]:
     """查询本机连到 Clash 代理端口(7890)的进程：谁在用 Clash（仅本地连接）。"""
     import config as cfg
 
-    port = cfg.CLASH_MIXED_PORT
+    port = _current_mixed_port()
     result: list[dict] = []
     try:
         proc = subprocess.run(
@@ -472,18 +676,22 @@ def apply_subscription(sub_id: int):
     config_path = Path(config.CLASH_CONFIG_PATH)
     config_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # 强制只监听本机，防止订阅配置覆盖后代理被暴露到公网
-    import re
-    clash_yaml = re.sub(r"allow-lan:\s*\w+", "allow-lan: true", clash_yaml, count=1)
-    if "bind-address:" in clash_yaml:
-        clash_yaml = re.sub(r"bind-address:\s*[^\n]+", 'bind-address: "127.0.0.1"', clash_yaml, count=1)
-    else:
-        clash_yaml = re.sub(r"(allow-lan:\s*\w+)", r'\1\nbind-address: "127.0.0.1"', clash_yaml, count=1)
-    config_path.write_text(clash_yaml, encoding="utf-8")
+    clash_data = yaml.safe_load(clash_yaml)
+    if not isinstance(clash_data, dict):
+        raise HTTPException(status_code=502, detail="订阅转换结果不是有效的 Clash YAML")
+
+    runtime_values = _effective_clash_yaml()
+    clash_data["external-controller"] = _controller_address()
+    for key in ("mixed-port", "allow-lan", "bind-address", "mode"):
+        if key in runtime_values:
+            clash_data[key] = runtime_values[key]
+
+    _write_clash_yaml(clash_data)
 
     # 让 Clash 重载配置（若 Clash 是用 -f 指定该路径启动的，重载会读新文件）
     try:
         _clash_request("PUT", "/configs")
+        _restore_persisted_proxy_selections()
     except Exception:
         # 文件已更新，重载失败可能因 Clash 未用该路径启动，仅告警
         pass
@@ -567,14 +775,14 @@ def _kill_listeners_on_tcp_port(port: int) -> None:
 def clash_start_or_restart():
     """
     若 Clash 未运行则启动，若已运行则先终止再启动。
-    启动前会释放 CLASH_MIXED_PORT上已有监听，避免端口占用。
+    启动前会释放当前 config.yaml 中 mixed-port 对应的监听，避免端口占用。
     返回 action: "started" | "restarted"
     """
     was_alive = _clash_alive()
     if was_alive:
         _stop_clash()
         time.sleep(2)
-    _kill_listeners_on_tcp_port(config.CLASH_MIXED_PORT)
+    _kill_listeners_on_tcp_port(_current_mixed_port())
     time.sleep(0.5)
     _start_clash()
     time.sleep(2)
@@ -584,8 +792,6 @@ def clash_start_or_restart():
 
 
 # ---------- 代理测试（经 Clash 出口访问站点 + 查看当前 IP/地址）-----------
-PROXY_URL = f"http://127.0.0.1:{config.CLASH_MIXED_PORT}"
-
 TEST_SITES = [
     {"name": "Google", "url": "https://www.google.com"},
     {"name": "Facebook", "url": "https://www.facebook.com"},
@@ -664,8 +870,8 @@ def test_proxy():
     """
     return {
         "with_proxy": {
-            "sites": _run_site_tests(PROXY_URL),
-            "ip": _run_ip_check(PROXY_URL),
+            "sites": _run_site_tests(_proxy_url()),
+            "ip": _run_ip_check(_proxy_url()),
         },
         "without_proxy": {
             "sites": _run_site_tests(None),
@@ -692,11 +898,11 @@ async def test_proxy_stream():
             return {"side": side, "type": "ip", "result": r}
 
         tasks = [
-            asyncio.create_task(run_site("with_proxy", PROXY_URL, s)) for s in TEST_SITES
+            asyncio.create_task(run_site("with_proxy", _proxy_url(), s)) for s in TEST_SITES
         ] + [
             asyncio.create_task(run_site("without_proxy", None, s)) for s in TEST_SITES
         ] + [
-            asyncio.create_task(run_ip("with_proxy", PROXY_URL)),
+            asyncio.create_task(run_ip("with_proxy", _proxy_url())),
             asyncio.create_task(run_ip("without_proxy", None)),
         ]
         for coro in asyncio.as_completed(tasks):

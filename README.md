@@ -30,7 +30,6 @@ cp config.sample.json config.json
 
 - `CLASH_BIN=/opt/clash/clash`
 - `CLASH_CONFIG_PATH=/opt/clash-config/config.yaml`
-- `CLASH_API_BASE=http://127.0.0.1:9090`
 
 这台机器上实际采用的方式不是 `apt install`，而是“源码编译 + 后端按路径启动”；其中软链接只是当前机器的一种接入方式，不是必须要求：
 
@@ -45,7 +44,6 @@ cp config.sample.json config.json
    `clash_bin`
    `clash_config_path`
    `clash_api_base`
-   `clash_mixed_port`
 5. 选择一种接入方式：
    方式 A：保持默认值，准备 `/opt/clash/clash`，可以是真实文件，也可以是软链接。
    如果你选择方式 A，可像当前机器一样创建软链接：
@@ -76,7 +74,7 @@ cp config.sample.json config.json
 
 - `/opt/clash/clash` 可以是真实文件，也可以像当前机器一样是一个软链接。
 - 只要 `config.json` 中的 `clash_bin` 指向一个可执行的 Clash 内核即可，不要求必须安装在 `/opt/clash/`。
-- `config.yaml` 需要与本项目配置一致，至少应保证 `external-controller: 127.0.0.1:9090`，并让代理端口与 `clash_mixed_port` 对应。
+- `config.yaml` 需要与本项目配置一致，至少应保证 `external-controller: 127.0.0.1:9090`；代理端口和 `allow-lan` 等运行时项应直接写在 `config.yaml` 里。
 - 若 `clash_config_path` 指向的文件不存在，后端会自动生成一份最小配置，确保 Clash 至少可以先启动并暴露控制器。
 - 如果你的 Clash 配置实际使用了 GeoIP 相关规则或功能，还需要按配置要求准备 `Country.mmdb`。
 - 如需跟随原始上游，也可以改为从 `https://github.com/BackupTime/clash.git` 克隆后再按同样步骤编译。
@@ -97,18 +95,19 @@ cp config.sample.json config.json
 
 ## 配置
 
-推荐通过 `config.sample.json` + `config.json` 的方式管理配置：
+推荐按两层配置管理：
 
+- `config.sample.json` / `config.json`：部署静态项
 - `clash_api_base`：Clash 控制器地址，默认 `http://127.0.0.1:9090`
-- `clash_mixed_port`：Clash 混合代理端口（HTTP/SOCKS 同一端口），默认 `7890`
 - `clash_config_path`：写入的配置路径，默认 `/opt/clash-config/config.yaml`
 - `clash_bin`：Clash 可执行文件路径，默认 `/opt/clash/clash`
 - `sub_converter_api`：订阅转 Clash 的 API，默认 `https://api.dler.io/sub`
 
 其中：
 
-- `config.sample.json`：仓库内的完整默认模板
-- `config.json`：本机部署覆盖项，不纳入版本控制
+- `config.sample.json` / `config.json`：只放部署静态项，例如 Clash 二进制路径、Clash 配置文件路径、控制器地址、订阅转换 API
+- `config.yaml`：Clash 运行时配置，保存 `mixed-port`、`allow-lan`、`bind-address`、代理组、规则等可实时调整的项
+- 后端在切换订阅时会保留当前 `config.yaml` 中的 `mixed-port`、`allow-lan`、`bind-address`，不会再被 `config.json` 覆盖
 
 ## 其他程序使用本地代理
 
