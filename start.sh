@@ -4,7 +4,7 @@
 # -------------------------------------------------------
 
 SESSION="clash-manager"
-PROJECT_DIR="/home/ubuntu/clash-manager"
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 CMD="uvicorn server:app --host 0.0.0.0 --port 9988 --reload"
 
 if screen -list | grep -q "\.${SESSION}[[:space:]]"; then
@@ -13,7 +13,7 @@ if screen -list | grep -q "\.${SESSION}[[:space:]]"; then
 fi
 
 screen -dmS "${SESSION}"
-screen -S "${SESSION}" -p 0 -X stuff "cd ${PROJECT_DIR}\n"
+screen -S "${SESSION}" -p 0 -X stuff "cd $(printf '%q' "${PROJECT_DIR}")\n"
 screen -S "${SESSION}" -p 0 -X stuff "${CMD}\n"
 
 echo "🎉 已在新的 screen 会话 '${SESSION}' 中启动 Clash Manager。"
