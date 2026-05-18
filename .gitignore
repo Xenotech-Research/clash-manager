@@ -8,6 +8,7 @@ web/dist/
 subscriptions.json
 current_subscription_id.json
 runtime_state.json
+profile_cache/
 
 .env
 .codex
