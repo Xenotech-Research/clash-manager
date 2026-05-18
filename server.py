@@ -140,8 +140,28 @@ def _current_mixed_port() -> int:
     return int(value)
 
 
+def _runtime_mixed_port_from_clash() -> int | None:
+    """从运行中的 Clash /configs 读取 mixed-port，避免磁盘配置与进程不一致时测速走错端口。"""
+    try:
+        r = _clash_request("GET", "/configs")
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, dict):
+            return None
+        raw = data.get("mixed-port")
+        if raw is None:
+            raw = data.get("mixed_port")
+        if raw is None:
+            return None
+        return int(raw)
+    except Exception:
+        return None
+
+
 def _proxy_url() -> str:
-    return f"http://127.0.0.1:{_current_mixed_port()}"
+    live = _runtime_mixed_port_from_clash()
+    port = live if live is not None else _current_mixed_port()
+    return f"http://127.0.0.1:{port}"
 
 
 def _subscription_via_clash_proxy_enabled() -> bool:
@@ -1080,15 +1100,42 @@ def _run_one_site(proxy: str | None, site: dict, timeout: float = 15.0) -> dict:
     status_code = None
     time_ms = None
     err = None
-    try:
-        t0 = time.perf_counter()
-        with httpx.Client(proxy=proxy, timeout=timeout, follow_redirects=True, headers=DEFAULT_HEADERS) as client:
-            r = client.get(site["url"])
-        time_ms = round((time.perf_counter() - t0) * 1000)
-        status_code = r.status_code
-        ok = 200 <= r.status_code < 400
-    except Exception as e:
-        err = str(e)
+    headers = DEFAULT_HEADERS
+    if proxy:
+        headers = {**DEFAULT_HEADERS, "Accept-Encoding": "gzip, deflate"}
+    client_kw: dict = dict(
+        proxy=proxy,
+        timeout=timeout,
+        follow_redirects=True,
+        headers=headers,
+        trust_env=False,
+    )
+    if proxy:
+        client_kw["limits"] = httpx.Limits(max_connections=10, max_keepalive_connections=0)
+    attempts = 3 if proxy else 1
+
+    def try_verify(verify: ssl.SSLContext | bool, n_attempts: int) -> bool:
+        nonlocal ok, status_code, time_ms, err
+        for attempt in range(n_attempts):
+            try:
+                t0 = time.perf_counter()
+                kw = {**client_kw, "verify": verify}
+                with httpx.Client(**kw) as client:
+                    r = client.get(site["url"])
+                time_ms = round((time.perf_counter() - t0) * 1000)
+                status_code = r.status_code
+                ok = 200 <= r.status_code < 400
+                err = None
+                return True
+            except Exception as e:
+                err = str(e)
+                if attempt < n_attempts - 1:
+                    time.sleep(0.25 * (attempt + 1))
+        return False
+
+    if not try_verify(True, attempts) and proxy and err and _tls_eof_like_error(err):
+        try_verify(_ssl_context_tls12_only(), 2)
+
     return {
         "name": site["name"],
         "url": site["url"],
@@ -1106,19 +1153,47 @@ def _run_site_tests(proxy: str | None, timeout: float = 15.0) -> list[dict]:
 
 def _run_ip_check(proxy: str | None, timeout: float = 10.0) -> dict:
     """查出口 IP/地址，proxy 为 None 表示直连。"""
-    ip_result = {"ip": None, "city": None, "region": None, "country": None, "org": None, "error": None}
-    try:
-        with httpx.Client(proxy=proxy, timeout=timeout) as client:
-            r = client.get("https://ipinfo.io/json")
-            r.raise_for_status()
-            data = r.json()
-            ip_result["ip"] = data.get("ip")
-            ip_result["city"] = data.get("city")
-            ip_result["region"] = data.get("region")
-            ip_result["country"] = data.get("country")
-            ip_result["org"] = data.get("org")
-    except Exception as e:
-        ip_result["error"] = str(e)
+    ip_result: dict = {"ip": None, "city": None, "region": None, "country": None, "org": None, "error": None}
+    client_kw: dict = dict(proxy=proxy, timeout=timeout, trust_env=False)
+    if proxy:
+        client_kw["limits"] = httpx.Limits(max_connections=10, max_keepalive_connections=0)
+    attempts = 3 if proxy else 1
+
+    def try_once(url: str, verify: ssl.SSLContext | bool, n_attempts: int) -> bool:
+        last_err: str | None = None
+        for attempt in range(n_attempts):
+            try:
+                kw = {**client_kw, "verify": verify}
+                with httpx.Client(**kw) as client:
+                    r = client.get(url)
+                    r.raise_for_status()
+                    data = r.json()
+                if isinstance(data, dict):
+                    ip_result["ip"] = data.get("ip")
+                    ip_result["city"] = data.get("city")
+                    ip_result["region"] = data.get("region")
+                    ip_result["country"] = data.get("country")
+                    ip_result["org"] = data.get("org")
+                ip_result["error"] = None
+                return True
+            except Exception as e:
+                last_err = str(e)
+                if attempt < n_attempts - 1:
+                    time.sleep(0.25 * (attempt + 1))
+        ip_result["error"] = last_err
+        return False
+
+    primary = "https://ipinfo.io/json"
+    fallback = "https://api.ipify.org?format=json"
+
+    if try_once(primary, True, attempts):
+        return ip_result
+    if proxy and _tls_eof_like_error(ip_result["error"] or ""):
+        if try_once(primary, _ssl_context_tls12_only(), 2):
+            return ip_result
+        if try_once(fallback, True, 2):
+            return ip_result
+        try_once(fallback, _ssl_context_tls12_only(), 2)
     return ip_result
 
 
@@ -1128,10 +1203,12 @@ def test_proxy():
     左右对比：左边经 Clash 代理、右边直连（不使用代理），
     各测站点可达性 + 出口 IP/地址。
     """
+    proxy_url = _proxy_url()
     return {
+        "proxy_url_used": proxy_url,
         "with_proxy": {
-            "sites": _run_site_tests(_proxy_url()),
-            "ip": _run_ip_check(_proxy_url()),
+            "sites": _run_site_tests(proxy_url),
+            "ip": _run_ip_check(proxy_url),
         },
         "without_proxy": {
             "sites": _run_site_tests(None),
@@ -1148,6 +1225,7 @@ async def test_proxy_stream():
     """
     async def generate():
         loop = asyncio.get_event_loop()
+        proxy_url = _proxy_url()
 
         async def run_site(side: str, proxy: str | None, site: dict):
             r = await loop.run_in_executor(None, _run_one_site, proxy, site)
@@ -1157,12 +1235,14 @@ async def test_proxy_stream():
             r = await loop.run_in_executor(None, _run_ip_check, proxy)
             return {"side": side, "type": "ip", "result": r}
 
+        yield f"data: {json.dumps({'type': 'meta', 'proxy_url_used': proxy_url}, ensure_ascii=False)}\n\n"
+
         tasks = [
-            asyncio.create_task(run_site("with_proxy", _proxy_url(), s)) for s in TEST_SITES
+            asyncio.create_task(run_site("with_proxy", proxy_url, s)) for s in TEST_SITES
         ] + [
             asyncio.create_task(run_site("without_proxy", None, s)) for s in TEST_SITES
         ] + [
-            asyncio.create_task(run_ip("with_proxy", _proxy_url())),
+            asyncio.create_task(run_ip("with_proxy", proxy_url)),
             asyncio.create_task(run_ip("without_proxy", None)),
         ]
         for coro in asyncio.as_completed(tasks):

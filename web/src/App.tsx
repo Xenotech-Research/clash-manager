@@ -511,6 +511,9 @@ function App() {
           setError(data.error || '测试出错')
           return
         }
+        if (data.type === 'meta') {
+          return
+        }
         const side = data.side as 'with_proxy' | 'without_proxy'
         setTestState((prev) => {
           const next = { ...prev, [side]: { ...prev[side] } }
@@ -661,14 +664,16 @@ function App() {
   // 按模式过滤列表内容（与 CfW 一致：切换 tab 会改变下面显示的内容）
   const displayGroups = (() => {
     if (clashMode === 'global') {
-      // 优先用配置文件里第一个 proxy-group 的名称（与 CfW 一致）
+      // Mihomo / Meta：global 模式实际由名为 GLOBAL 的策略组决定出站。
+      // 若优先用 yaml 第一个组（常为「节点选择」），界面选的节点不会生效，连通性测试 IP 会与直连相同。
+      const metaGlobal = allGroups.find(([name]) => name.toUpperCase() === 'GLOBAL')
+      if (metaGlobal) return [metaGlobal]
       if (globalGroupName) {
         const g = allGroups.find(([name]) => name === globalGroupName)
         if (g) return [g]
       }
       const globalGroup = allGroups.find(
         ([name]) =>
-          name.toUpperCase() === 'GLOBAL' ||
           name === 'Proxy' ||
           name === 'Proxies' ||
           name === '节点选择' ||
