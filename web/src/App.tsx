@@ -3,7 +3,7 @@ import './App.css'
 
 const API = '/api'
 
-type Subscription = { id: number; url: string; name: string }
+type Subscription = { id: number; url: string; name: string; has_cached_profile?: boolean }
 
 type ProxyItem = { name: string; type: string; now?: string; all?: string[] }
 type ProxiesRes = { proxies: Record<string, ProxyItem>; clash_available?: boolean }
@@ -150,6 +150,8 @@ function App() {
   const [settingsMessage, setSettingsMessage] = useState<string | null>(null)
   const [toast, setToast] = useState<{ type: 'success' | 'error'; message: string } | null>(null)
   const trafficPrevRef = useRef<{ uploadTotal: number; downloadTotal: number; ts: number } | null>(null)
+  const [subscriptionFetchViaClashProxy, setSubscriptionFetchViaClashProxy] = useState(false)
+  const [prefsLoading, setPrefsLoading] = useState(false)
 
   const hasRuntimeConfigChanges = !!(
     runtimeConfig &&
@@ -160,6 +162,38 @@ function App() {
       runtimeConfig.bind_address !== runtimeConfigDraft.bind_address
     )
   )
+
+  const fetchPreferences = async () => {
+    const r = await fetch(`${API}/preferences`)
+    if (!r.ok) return
+    const data = (await r.json()) as { subscription_fetch_via_clash_proxy?: boolean }
+    setSubscriptionFetchViaClashProxy(!!data.subscription_fetch_via_clash_proxy)
+  }
+
+  const setSubscriptionViaClashProxy = async (value: boolean) => {
+    setPrefsLoading(true)
+    setSubscriptionFetchViaClashProxy(value)
+    try {
+      const r = await fetch(`${API}/preferences`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ subscription_fetch_via_clash_proxy: value }),
+      })
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}))
+        throw new Error(
+          typeof (err as { detail?: unknown }).detail === 'string'
+            ? (err as { detail: string }).detail
+            : r.statusText,
+        )
+      }
+    } catch (e) {
+      setSubscriptionFetchViaClashProxy(!value)
+      setError(e instanceof Error ? e.message : '偏好保存失败')
+    } finally {
+      setPrefsLoading(false)
+    }
+  }
 
   const fetchSubs = async () => {
     const r = await fetch(`${API}/subscriptions`)
@@ -268,6 +302,7 @@ function App() {
     fetchCurrentSub().catch(console.error)
     checkHealth().catch(console.error)
     fetchRuntimeConfig().catch(console.error)
+    fetchPreferences().catch(console.error)
   }, [])
 
   useEffect(() => {
@@ -369,18 +404,37 @@ function App() {
     }
   }
 
-  const applySub = async (id: number) => {
+  const refreshSubProfile = async (id: number) => {
     setError(null)
-    setLoading(`apply-${id}`)
+    setLoading(`refresh-${id}`)
     try {
-      const r = await fetch(`${API}/subscriptions/${id}/apply`, { method: 'POST' })
+      const r = await fetch(`${API}/subscriptions/${id}/refresh`, { method: 'POST' })
+      const data = (await r.json()) as { detail?: string; message?: string }
+      if (!r.ok) throw new Error(data.detail ?? r.statusText)
+      await fetchSubs()
+      setToast({
+        type: 'success',
+        message: typeof data.message === 'string' ? data.message : '本地缓存已更新',
+      })
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '刷新订阅失败')
+    } finally {
+      setLoading(null)
+    }
+  }
+
+  const switchSubProfile = async (id: number) => {
+    setError(null)
+    setLoading(`switch-${id}`)
+    try {
+      const r = await fetch(`${API}/subscriptions/${id}/switch`, { method: 'POST' })
       if (!r.ok) throw new Error((await r.json()).detail ?? r.statusText)
       await checkHealth()
       await fetchProxies()
       await fetchCurrentSub()
       await fetchGlobalGroupName()
     } catch (e) {
-      setError(e instanceof Error ? e.message : '应用订阅失败')
+      setError(e instanceof Error ? e.message : '切换失败')
     } finally {
       setLoading(null)
     }
@@ -775,6 +829,21 @@ function App() {
                 {loading === 'add' ? '下载中…' : '下载'}
               </button>
             </div>
+            <label className="subs-proxy-option">
+              <input
+                type="checkbox"
+                checked={subscriptionFetchViaClashProxy}
+                disabled={prefsLoading}
+                onChange={(e) => void setSubscriptionViaClashProxy(e.target.checked)}
+              />
+              <span>
+                点击「刷新」从网络拉取订阅时，HTTP 出站经本机 Clash 的 mixed-port 代理{' '}
+                {proxyInfo && <code className="subs-proxy-option-url">{proxyInfo.proxy_url}</code>}
+              </span>
+            </label>
+            <p className="subs-profile-hint">
+              「刷新」只更新该订阅的<strong>本地缓存</strong>（不切换当前 Clash 配置）；点卡片则从缓存<strong>切换</strong>到对应配置。
+            </p>
             <div className="tab-body">
             <div className="profile-cards">
               {subs.map((s) => (
@@ -782,10 +851,24 @@ function App() {
                   key={s.id}
                   role="button"
                   tabIndex={0}
-                  className={`profile-card ${currentSubId === s.id ? 'active' : ''} ${loading === `apply-${s.id}` ? 'loading' : ''}`}
-                  onClick={() => applySub(s.id)}
-                  onKeyDown={(e) => e.key === 'Enter' && applySub(s.id)}
+                  className={`profile-card ${currentSubId === s.id ? 'active' : ''} ${
+                    loading === `switch-${s.id}` || loading === `refresh-${s.id}` ? 'loading' : ''
+                  }`}
+                  onClick={() => void switchSubProfile(s.id)}
+                  onKeyDown={(e) => e.key === 'Enter' && void switchSubProfile(s.id)}
                 >
+                  <button
+                    type="button"
+                    className="profile-card-refresh"
+                    title="从远端拉取最新内容，仅写入本地缓存（不切换当前生效配置）"
+                    disabled={!!loading}
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      void refreshSubProfile(s.id)
+                    }}
+                  >
+                    刷新
+                  </button>
                   <button
                     type="button"
                     className="profile-card-delete"
@@ -797,8 +880,14 @@ function App() {
                   <div className="profile-card-body">
                     <span className="profile-card-title">{s.name || '未命名'}</span>
                     <span className="profile-card-desc">{s.url}</span>
-                    {loading === `apply-${s.id}` && (
+                    {!s.has_cached_profile && (
+                      <span className="profile-card-hint">尚无本地缓存，首次请点「刷新」</span>
+                    )}
+                    {loading === `switch-${s.id}` && (
                       <span className="profile-card-status">切换中…</span>
+                    )}
+                    {loading === `refresh-${s.id}` && (
+                      <span className="profile-card-status">刷新中…</span>
                     )}
                   </div>
                 </div>
@@ -841,7 +930,7 @@ function App() {
               <p className="empty">
                 {clashMode === 'direct'
                   ? '当前配置无 Direct/Reject 项'
-                  : '暂无代理组，请先在「管理订阅」中下载并应用订阅。'}
+                  : '暂无代理组，请先「管理订阅」中刷新任一订阅或使用本地缓存切换。'}
               </p>
             )}
             {displayGroups.map(([groupName, p]) => (

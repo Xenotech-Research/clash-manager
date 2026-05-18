@@ -5,9 +5,11 @@ Clash 订阅管理 + 节点切换后端
 - 维持 Clash 内核运行：启动时若未检测到则拉起，后台定时检测并自动重启
 """
 import asyncio
+import copy
 import json
 import os
 import signal
+import ssl
 import subprocess
 import time
 from contextlib import asynccontextmanager
@@ -26,6 +28,7 @@ import config
 
 SUBS_FILE = Path(__file__).resolve().parent / "subscriptions.json"
 CURRENT_SUB_FILE = Path(__file__).resolve().parent / "current_subscription_id.json"
+PROFILE_CACHE_DIR = Path(__file__).resolve().parent / "profile_cache"
 CLASH_LOG = Path(__file__).resolve().parent / "logs" / "clash.log"
 TRAFFIC_LOG_DIR = Path(__file__).resolve().parent / "logs"
 DEFAULT_CLASH_CONFIG_YAML = Path(__file__).resolve().parent / "default_clash_config.yaml"
@@ -139,6 +142,67 @@ def _current_mixed_port() -> int:
 
 def _proxy_url() -> str:
     return f"http://127.0.0.1:{_current_mixed_port()}"
+
+
+def _subscription_via_clash_proxy_enabled() -> bool:
+    return bool(_load_runtime_state().get("subscription_fetch_via_clash_proxy", False))
+
+
+def _ssl_context_tls12_only() -> ssl.SSLContext:
+    """部分中转/劣质节点在 TLS 1.3 或与 OpenSSL 组合下会半截断链，强制 TLS 1.2 偶尔可恢复。"""
+    ctx = ssl.create_default_context()
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+    return ctx
+
+
+def _tls_eof_like_error(msg: str) -> bool:
+    if not msg:
+        return False
+    u = msg.upper()
+    return "SSL" in u and ("EOF" in u or "UNEXPECTED_EOF" in u or "VIOLATION OF PROTOCOL" in u)
+
+
+def _httpx_client_kwargs_for_subscription_fetch() -> dict:
+    """订阅从网络刷新时的出站 HTTP：可选经本机 Clash mixed-port。"""
+    opts: dict = dict(timeout=60.0, follow_redirects=True)
+    if _subscription_via_clash_proxy_enabled():
+        opts["proxy"] = _proxy_url()
+        opts["trust_env"] = False
+        # 与站点连通性测试一致：经本地代理时关掉 keep-alive，减轻 TLS 半截关闭 / 坏连接复用导致的
+        # [SSL: UNEXPECTED_EOF_WHILE_READING]。
+        opts["limits"] = httpx.Limits(max_connections=10, max_keepalive_connections=0)
+    return opts
+
+
+def _subscription_http_get(client_kw: dict, url: str, *, headers: dict[str, str]) -> httpx.Response:
+    """订阅与转换 URL 拉取：短暂重试；经代理且为 TLS EOF 类错误时再试仅 TLS 1.2。"""
+    attempts = 3
+    uses_proxy = bool(client_kw.get("proxy"))
+    last_err: BaseException | None = None
+
+    def run_phase(kw: dict) -> httpx.Response | None:
+        nonlocal last_err
+        for attempt in range(attempts):
+            try:
+                with httpx.Client(**kw) as client:
+                    return client.get(url, headers=headers)
+            except httpx.RequestError as e:
+                last_err = e
+                if attempt < attempts - 1:
+                    time.sleep(0.25 * (attempt + 1))
+        return None
+
+    r = run_phase(client_kw)
+    if r is not None:
+        return r
+    if uses_proxy and last_err is not None and _tls_eof_like_error(str(last_err)):
+        kw12 = {**client_kw, "verify": _ssl_context_tls12_only()}
+        r = run_phase(kw12)
+        if r is not None:
+            return r
+    assert last_err is not None
+    raise last_err
 
 
 def _persist_mode_to_yaml(mode: str) -> None:
@@ -313,6 +377,10 @@ class SubscriptionCreate(BaseModel):
 class SubscriptionUpdate(BaseModel):
     url: str | None = None
     name: str | None = None
+
+
+class ManagerPreferencesUpdate(BaseModel):
+    subscription_fetch_via_clash_proxy: bool
 
 
 class RuntimeConfigUpdate(BaseModel):
@@ -604,9 +672,36 @@ def clash_proxy_clients():
 
 
 # ---------- 订阅管理 ----------
+def _subscription_cache_file(sub_id: int) -> Path:
+    return PROFILE_CACHE_DIR / f"{sub_id}.yaml"
+
+
+def _subscription_has_cache(sub_id: int) -> bool:
+    return _subscription_cache_file(sub_id).is_file()
+
+
+def _remove_subscription_cache(sub_id: int) -> None:
+    _subscription_cache_file(sub_id).unlink(missing_ok=True)
+
+
+def _save_subscription_cache_snapshot(sub_id: int, clash_data: dict) -> None:
+    PROFILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _subscription_cache_file(sub_id).write_text(
+        yaml.safe_dump(dict(clash_data), allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+
 @app.get("/api/subscriptions")
 def list_subscriptions():
-    return _load_subs()
+    subs = _load_subs()
+    out: list[dict] = []
+    for s in subs:
+        row = dict(s)
+        sid = row.get("id")
+        row["has_cached_profile"] = _subscription_has_cache(int(sid)) if isinstance(sid, int) else False
+        out.append(row)
+    return out
 
 
 @app.get("/api/subscriptions/current")
@@ -630,12 +725,28 @@ def update_subscription(sub_id: int, sub: SubscriptionUpdate):
     for s in subs:
         if s.get("id") == sub_id:
             if sub.url is not None:
+                prev = str(s.get("url") or "").strip()
+                if str(sub.url).strip() != prev:
+                    _remove_subscription_cache(sub_id)
                 s["url"] = sub.url
             if sub.name is not None:
                 s["name"] = sub.name
             _save_subs(subs)
             return s
     raise HTTPException(status_code=404, detail="订阅不存在")
+
+
+@app.get("/api/preferences")
+def get_preferences():
+    return {"subscription_fetch_via_clash_proxy": _subscription_via_clash_proxy_enabled()}
+
+
+@app.patch("/api/preferences")
+def patch_preferences(body: ManagerPreferencesUpdate):
+    state = _load_runtime_state()
+    state["subscription_fetch_via_clash_proxy"] = bool(body.subscription_fetch_via_clash_proxy)
+    _save_runtime_state(state)
+    return {"ok": True, "subscription_fetch_via_clash_proxy": state["subscription_fetch_via_clash_proxy"]}
 
 
 @app.delete("/api/subscriptions/{sub_id}")
@@ -645,59 +756,208 @@ def delete_subscription(sub_id: int):
     if len(new_subs) == len(subs):
         raise HTTPException(status_code=404, detail="订阅不存在")
     _save_subs(new_subs)
+    _remove_subscription_cache(sub_id)
     if _get_current_sub_id() == sub_id:
         _set_current_sub_id(None)
     return {"ok": True}
 
 
-@app.post("/api/subscriptions/{sub_id}/apply")
-def apply_subscription(sub_id: int):
+def _upstream_http_headers() -> dict[str, str]:
+    """访问订阅转换/CDN（如 api.dler.io）时用浏览器 UA，降低被拒概率。"""
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+    }
+
+
+def _subscription_source_headers() -> dict[str, str]:
     """
-    从该订阅链接拉取内容 → 用转换 API 转为 Clash 配置 → 写入 CLASH_CONFIG_PATH → 让 Clash 重载配置
+    访问机场/提供商的订阅原始链接。
+    不少面板按 User-Agent 分流：浏览器 UA 给 base64 节点列表，Clash UA 才给完整 YAML。
     """
-    subs = _load_subs()
-    sub = next((s for s in subs if s.get("id") == sub_id), None)
-    if not sub:
-        raise HTTPException(status_code=404, detail="订阅不存在")
-    sub_url = sub["url"]
+    return {"User-Agent": "Clash/1.18.3", "Accept": "*/*"}
 
-    # 使用订阅转换 API：target=clash&url=订阅链接
-    converter = config.SUB_CONVERTER_API.rstrip("/")
-    if "?" in converter:
-        fetch_url = f"{converter}&target=clash&url={quote(sub_url)}"
-    else:
-        fetch_url = f"{converter}?target=clash&url={quote(sub_url)}"
 
-    with httpx.Client(timeout=60.0, follow_redirects=True) as client:
-        r = client.get(fetch_url)
-        r.raise_for_status()
-        clash_yaml = r.text
+def _try_clash_dict_from_subscription_payload(raw_text: str) -> dict | None:
+    """若订阅链接本体即返回 Clash YAML，则跳过远程转换接口。"""
+    body = (raw_text or "").strip()
+    if body.startswith("\ufeff"):
+        body = body[1:].strip()
+    if not body:
+        return None
+    try:
+        data = yaml.safe_load(body)
+    except Exception:
+        return None
+    if isinstance(data, dict) and "proxies" in data:
+        return data
+    return None
 
-    config_path = Path(config.CLASH_CONFIG_PATH)
-    config_path.parent.mkdir(parents=True, exist_ok=True)
 
-    clash_data = yaml.safe_load(clash_yaml)
-    if not isinstance(clash_data, dict):
-        raise HTTPException(status_code=502, detail="订阅转换结果不是有效的 Clash YAML")
-
+def _merge_runtime_into_clash_dict(clash_data: dict) -> None:
     runtime_values = _effective_clash_yaml()
     clash_data["external-controller"] = _controller_address()
     for key in ("mixed-port", "allow-lan", "bind-address", "mode"):
         if key in runtime_values:
             clash_data[key] = runtime_values[key]
 
-    _write_clash_yaml(clash_data)
 
-    # 让 Clash 重载配置（若 Clash 是用 -f 指定该路径启动的，重载会读新文件）
+def _finalize_subscription_deploy(
+    sub_id: int,
+    clash_data: dict,
+    *,
+    update_snapshot: bool,
+    ok_message: str,
+) -> dict:
+    if not isinstance(clash_data, dict):
+        raise HTTPException(status_code=502, detail="无效 Clash 配置结构")
+    _merge_runtime_into_clash_dict(clash_data)
+    config_path = Path(config.CLASH_CONFIG_PATH)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_clash_yaml(clash_data)
+    if update_snapshot:
+        _save_subscription_cache_snapshot(sub_id, clash_data)
     try:
         _clash_request("PUT", "/configs")
         _restore_persisted_proxy_selections()
     except Exception:
-        # 文件已更新，重载失败可能因 Clash 未用该路径启动，仅告警
         pass
-
     _set_current_sub_id(sub_id)
-    return {"ok": True, "message": "配置已写入并已触发重载", "path": str(config_path)}
+    return {"ok": True, "message": ok_message, "path": str(config_path)}
+
+
+def _pull_remote_subscription_to_clash_dict(sub_url: str) -> dict:
+    """从订阅 URL / 转换服务拉取并解析为 Clash dict。"""
+    clash_data = None
+    direct_fetch_note = ""
+
+    hdrs_provider = _subscription_source_headers()
+    hdrs_converter = _upstream_http_headers()
+    sub_client_kw = _httpx_client_kwargs_for_subscription_fetch()
+    try:
+        sub_resp = _subscription_http_get(sub_client_kw, sub_url, headers=hdrs_provider)
+        sub_resp.raise_for_status()
+        clash_data = _try_clash_dict_from_subscription_payload(sub_resp.text)
+    except httpx.HTTPStatusError as e:
+        status = getattr(e.response, "status_code", None)
+        reason = getattr(e.response, "reason_phrase", "") or ""
+        direct_fetch_note = f"直接访问订阅链接得到 HTTP {status} {reason.strip()}。"
+    except httpx.RequestError as e:
+        direct_fetch_note = f"直接访问订阅链接失败：{e!s}。"
+
+    if clash_data is None:
+        converter = config.SUB_CONVERTER_API.rstrip("/")
+        if "?" in converter:
+            fetch_url = f"{converter}&target=clash&url={quote(sub_url)}"
+        else:
+            fetch_url = f"{converter}?target=clash&url={quote(sub_url)}"
+
+        try:
+            r = _subscription_http_get(sub_client_kw, fetch_url, headers=hdrs_converter)
+            r.raise_for_status()
+            clash_yaml = r.text
+        except httpx.HTTPStatusError as e:
+            code = e.response.status_code if e.response is not None else 0
+            tip = ""
+            if code == 403:
+                tip = (
+                    "公共服务常拒绝从自身服务器替你拉取某些订阅地址。"
+                    "可自建 subconverter（或换其它可用的 sub_converter_api），"
+                    "或改用直接返回 Clash YAML 格式的订阅。"
+                )
+            detail = (
+                f"订阅转换服务返回 HTTP {code}。"
+                + (tip if tip else "")
+                + (f" [{direct_fetch_note}]" if direct_fetch_note else "")
+            )
+            raise HTTPException(status_code=502, detail=detail.strip())
+        except httpx.RequestError as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"无法连接到订阅转换服务：{e!s}"
+                + (f" [{direct_fetch_note}]" if direct_fetch_note else ""),
+            )
+
+        clash_data = yaml.safe_load(clash_yaml)
+
+    if not isinstance(clash_data, dict):
+        raise HTTPException(status_code=502, detail="订阅转换结果不是有效的 Clash YAML")
+    return clash_data
+
+
+def _subscription_refresh_cache_only_impl(sub_id: int) -> dict:
+    """仅从网络刷新 profile_cache/{id}.yaml，不写入当前 Clash 配置、不改变当前选中订阅。"""
+    subs = _load_subs()
+    sub = next((s for s in subs if s.get("id") == sub_id), None)
+    if not sub:
+        raise HTTPException(status_code=404, detail="订阅不存在")
+    clash_data = _pull_remote_subscription_to_clash_dict(sub["url"])
+    snap = copy.deepcopy(clash_data)
+    _merge_runtime_into_clash_dict(snap)
+    _save_subscription_cache_snapshot(sub_id, snap)
+    return {
+        "ok": True,
+        "message": "已更新本地缓存，当前运行配置未改动；点此订阅卡片可从缓存切换。",
+        "cache_path": str(_subscription_cache_file(sub_id)),
+    }
+
+
+def _subscription_refresh_and_activate_impl(sub_id: int) -> dict:
+    """拉取远端并写入当前 Clash 配置、设为当前选中（兼容 /apply）。"""
+    subs = _load_subs()
+    sub = next((s for s in subs if s.get("id") == sub_id), None)
+    if not sub:
+        raise HTTPException(status_code=404, detail="订阅不存在")
+    clash_data = _pull_remote_subscription_to_clash_dict(sub["url"])
+    return _finalize_subscription_deploy(
+        sub_id,
+        clash_data,
+        update_snapshot=True,
+        ok_message="已从订阅拉取并切换为当前配置",
+    )
+
+
+def _subscription_switch_impl(sub_id: int) -> dict:
+    subs = _load_subs()
+    sub = next((s for s in subs if s.get("id") == sub_id), None)
+    if not sub:
+        raise HTTPException(status_code=404, detail="订阅不存在")
+    cf = _subscription_cache_file(sub_id)
+    if not cf.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="该订阅暂无本地缓存，请先点击「刷新」从远端拉取一次。",
+        )
+    clash_data = yaml.safe_load(cf.read_text(encoding="utf-8"))
+    if not isinstance(clash_data, dict):
+        raise HTTPException(status_code=502, detail="本地缓存损坏，请重新刷新该订阅")
+    return _finalize_subscription_deploy(
+        sub_id,
+        clash_data,
+        update_snapshot=False,
+        ok_message="已切换为该订阅的本地缓存（未重新下载）",
+    )
+
+
+@app.post("/api/subscriptions/{sub_id}/refresh")
+def subscription_refresh(sub_id: int):
+    """从订阅链接重新拉取，仅更新本地 profile 缓存。"""
+    return _subscription_refresh_cache_only_impl(sub_id)
+
+
+@app.post("/api/subscriptions/{sub_id}/switch")
+def subscription_switch(sub_id: int):
+    """仅使用上次刷新时保存的本地缓存切换 profile，不访问网络。"""
+    return _subscription_switch_impl(sub_id)
+
+
+@app.post("/api/subscriptions/{sub_id}/apply")
+def apply_subscription(sub_id: int):
+    """拉取并切换为当前配置（兼容脚本/旧客户端；网页请用「刷新」+「点卡片切换」）。"""
+    return _subscription_refresh_and_activate_impl(sub_id)
 
 
 @app.get("/api/health")
