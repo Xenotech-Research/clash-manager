@@ -3,6 +3,8 @@
 # 自动启动 Clash Manager（FastAPI + 静态前端由 nginx 提供）
 # -------------------------------------------------------
 
+screen -wipe >/dev/null 2>&1 || true
+
 SESSION="clash-manager"
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 CMD="uvicorn server:app --host 0.0.0.0 --port 9988 --reload"
