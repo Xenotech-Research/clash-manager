@@ -109,6 +109,17 @@ cp config.sample.json config.json
 - `config.yaml`：Clash 运行时配置，保存 `mixed-port`、`allow-lan`、`bind-address`、代理组、规则等可实时调整的项
 - 后端在切换订阅时会保留当前 `config.yaml` 中的 `mixed-port`、`allow-lan`、`bind-address`，不会再被 `config.json` 覆盖
 
+## Claude 托管后处理
+
+“Claude 后处理”页面管理一条可随订阅刷新、切换和应用持续保留的链路：列出的**精确域名**会走“当前订阅已选节点 → 住宅 SOCKS5”。域名和上游选择组可直接编辑；密码为只写字段，API 和页面只显示“已配置”，不会回显。
+
+- 原始订阅内容始终保留在 `profile_cache/`；后处理仅在部署到 `config.yaml` 时叠加，因此不会污染缓存，也不会在重复应用时累积规则。
+- 保存/部署先用本机原版 Clash 做配置校验，再创建仅属主可读的备份，最后通过 Clash 热重载更新代理和规则表，不重启监听端口。
+- 当前为 **Global** 时，默认“保持原 Global 行为”：Manager 切到 **Rule** 以让精确域名规则生效，并紧接着放置 `MATCH,GLOBAL`。因此其它流量仍沿用此前 Global 所选出口；只有这些精确域名进入托管链路。
+- 若改为“使用订阅原始 Rule 行为”，其它流量将按订阅规则处理；此策略需要运行模式为 **Rule**。手动切到 **Global** 或 **Direct** 时，Clash 会绕过规则，托管链路不会接管流量。
+
+敏感运行状态、订阅缓存、活动 Clash 配置与部署备份均按属主可读写权限保存，并被 `.gitignore` 排除。
+
 ## 其他程序使用本地代理
 
 本服务使用的 Clash 在本地提供代理，默认地址为 **`http://127.0.0.1:7890`**（与 Clash for Windows 常见配置一致）。要让终端、IDE、npm、git 等走该代理，可：

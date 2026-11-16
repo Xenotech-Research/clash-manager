@@ -9,6 +9,8 @@ subscriptions.json
 current_subscription_id.json
 runtime_state.json
 profile_cache/
+managed_postprocess.json
+deployment_backups/
 
 .env
 .codex

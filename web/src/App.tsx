@@ -8,14 +8,16 @@ type Subscription = { id: number; url: string; name: string; has_cached_profile?
 type ProxyItem = { name: string; type: string; now?: string; all?: string[] }
 type ProxiesRes = { proxies: Record<string, ProxyItem>; clash_available?: boolean }
 
-type Tab = 'subs' | 'nodes' | 'test' | 'traffic' | 'settings'
+type Tab = 'subs' | 'nodes' | 'routing' | 'test' | 'traffic' | 'settings'
 const TAB_STORAGE_KEY = 'clash-manager-tab'
 
 function getInitialTab(): Tab {
   try {
     const saved = localStorage.getItem(TAB_STORAGE_KEY)
-    if (saved === 'subs' || saved === 'nodes' || saved === 'test' || saved === 'traffic' || saved === 'settings') return saved
-  } catch (_) {}
+    if (saved === 'subs' || saved === 'nodes' || saved === 'routing' || saved === 'test' || saved === 'traffic' || saved === 'settings') return saved
+  } catch {
+    // Storage may be disabled; default to the subscriptions page.
+  }
   return 'subs'
 }
 
@@ -49,6 +51,48 @@ type RuntimeConfig = {
 }
 
 type AccessScope = 'local_only' | 'lan'
+
+type ManagedResidential = {
+  server: string
+  port: number | null
+  username: string
+  password_configured: boolean
+}
+
+type ManagedPostprocess = {
+  enabled: boolean
+  domains: string[]
+  upstream_group: string
+  non_target_behavior: 'subscription_rules' | 'global_passthrough'
+  non_target_behavior_note: string
+  resolved_upstream_group: string | null
+  available_upstream_groups: string[]
+  upstream_error: string | null
+  residential: ManagedResidential
+  current_mode: ClashMode
+  installed_in_active_config: boolean
+  active_in_current_mode: boolean
+  managed_rule_count: number
+  mode_note: Record<ClashMode, string>
+}
+
+type ManagedPostprocessDraft = {
+  enabled: boolean
+  domainsText: string
+  upstream_group: string
+  non_target_behavior: 'subscription_rules' | 'global_passthrough'
+  server: string
+  port: number | null
+  username: string
+  password: string
+}
+
+type ManagedDeployment = {
+  deployment_changed?: boolean
+  backup_created?: boolean
+  hot_reloaded?: boolean
+  upstream_group?: string | null
+}
 
 function formatBytes(n: number): string {
   if (n >= 1024 * 1024 * 1024) return (n / (1024 * 1024 * 1024)).toFixed(2) + ' GB'
@@ -152,6 +196,10 @@ function App() {
   const trafficPrevRef = useRef<{ uploadTotal: number; downloadTotal: number; ts: number } | null>(null)
   const [subscriptionFetchViaClashProxy, setSubscriptionFetchViaClashProxy] = useState(false)
   const [prefsLoading, setPrefsLoading] = useState(false)
+  const [postprocess, setPostprocess] = useState<ManagedPostprocess | null>(null)
+  const [postprocessDraft, setPostprocessDraft] = useState<ManagedPostprocessDraft | null>(null)
+  const [postprocessLoading, setPostprocessLoading] = useState(false)
+  const [postprocessMessage, setPostprocessMessage] = useState<string | null>(null)
 
   const hasRuntimeConfigChanges = !!(
     runtimeConfig &&
@@ -163,11 +211,48 @@ function App() {
     )
   )
 
+  const hasPostprocessChanges = !!(
+    postprocess &&
+    postprocessDraft &&
+    (
+      postprocess.enabled !== postprocessDraft.enabled ||
+      postprocess.domains.join('\n') !== postprocessDraft.domainsText ||
+      postprocess.upstream_group !== postprocessDraft.upstream_group ||
+      postprocess.non_target_behavior !== postprocessDraft.non_target_behavior ||
+      postprocess.residential.server !== postprocessDraft.server ||
+      postprocess.residential.port !== postprocessDraft.port ||
+      postprocess.residential.username !== postprocessDraft.username ||
+      postprocessDraft.password.length > 0
+    )
+  )
+
   const fetchPreferences = async () => {
     const r = await fetch(`${API}/preferences`)
     if (!r.ok) return
     const data = (await r.json()) as { subscription_fetch_via_clash_proxy?: boolean }
     setSubscriptionFetchViaClashProxy(!!data.subscription_fetch_via_clash_proxy)
+  }
+
+  const setPostprocessFromApi = (data: ManagedPostprocess) => {
+    setPostprocess(data)
+    setPostprocessDraft({
+      enabled: data.enabled,
+      domainsText: data.domains.join('\n'),
+      upstream_group: data.upstream_group,
+      non_target_behavior: data.non_target_behavior,
+      server: data.residential.server,
+      port: data.residential.port,
+      username: data.residential.username,
+      // The API deliberately never returns this value.  A blank field means
+      // "retain the saved password" when the user changes another setting.
+      password: '',
+    })
+  }
+
+  const fetchPostprocess = async () => {
+    const r = await fetch(`${API}/postprocess/claude-residential`)
+    if (!r.ok) throw new Error(r.statusText)
+    setPostprocessFromApi((await r.json()) as ManagedPostprocess)
   }
 
   const setSubscriptionViaClashProxy = async (value: boolean) => {
@@ -303,12 +388,17 @@ function App() {
     checkHealth().catch(console.error)
     fetchRuntimeConfig().catch(console.error)
     fetchPreferences().catch(console.error)
+    fetchPostprocess().catch(console.error)
+  // Bootstrap only once; these helpers intentionally populate initial state.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
     try {
       localStorage.setItem(TAB_STORAGE_KEY, tab)
-    } catch (_) {}
+    } catch {
+      // Local storage is optional.
+    }
   }, [tab])
 
   useEffect(() => {
@@ -376,7 +466,9 @@ function App() {
           const { clients } = await clientsR.json()
           setProxyClients(clients || [])
         }
-      } catch (_) {}
+      } catch {
+        // A transient polling failure should not clear already-rendered data.
+      }
     }
     tick()
     const interval = setInterval(tick, 2000)
@@ -433,6 +525,7 @@ function App() {
       await fetchProxies()
       await fetchCurrentSub()
       await fetchGlobalGroupName()
+      await fetchPostprocess()
     } catch (e) {
       setError(e instanceof Error ? e.message : '切换失败')
     } finally {
@@ -478,6 +571,7 @@ function App() {
       })
       if (!r.ok) throw new Error(r.statusText)
       setClashMode(mode)
+      await fetchPostprocess()
     } catch (e) {
       setError(e instanceof Error ? e.message : '切换模式失败')
     }
@@ -526,7 +620,9 @@ function App() {
           }
           return next
         })
-      } catch (_) {}
+      } catch {
+        // Ignore a malformed SSE event and wait for the next one.
+      }
     }
     eventSource.onerror = () => {
       eventSource.close()
@@ -605,6 +701,97 @@ function App() {
     }
   }
 
+  const savePostprocess = async (applyNow: boolean) => {
+    if (!postprocessDraft) return
+    setError(null)
+    setPostprocessMessage(null)
+    setPostprocessLoading(true)
+    try {
+      const residential: {
+        server: string
+        port: number | null
+        username: string
+        password?: string
+      } = {
+        server: postprocessDraft.server.trim(),
+        port: postprocessDraft.port,
+        username: postprocessDraft.username.trim(),
+      }
+      // Do not send an empty field: empty means retain the password already
+      // stored server-side, and the browser never receives that saved value.
+      if (postprocessDraft.password.length > 0) residential.password = postprocessDraft.password
+      const payload = {
+        enabled: postprocessDraft.enabled,
+        domains: postprocessDraft.domainsText
+          .split(/\r?\n/)
+          .map((domain) => domain.trim())
+          .filter(Boolean),
+        upstream_group: postprocessDraft.upstream_group,
+        non_target_behavior: postprocessDraft.non_target_behavior,
+        residential,
+        apply_now: applyNow,
+      }
+      const r = await fetch(`${API}/postprocess/claude-residential`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      const data = await r.json().catch(() => ({})) as Partial<ManagedPostprocess> & { detail?: string; deployment?: ManagedDeployment | null }
+      if (!r.ok) {
+        // The settings can have been safely persisted before an isolated
+        // syntax check rejects deployment; refresh only redacted state.
+        await fetchPostprocess().catch(() => {})
+        throw new Error(typeof data.detail === 'string' ? data.detail : r.statusText)
+      }
+      setPostprocessFromApi(data as ManagedPostprocess)
+      const deployment = data.deployment
+      if (applyNow) {
+        setPostprocessMessage(
+          deployment?.hot_reloaded
+            ? '托管后处理已保存并已热重载。'
+            : '托管后处理已保存；当前配置文件已更新，但 Clash 未确认热重载。'
+        )
+        await Promise.all([
+          fetchProxies().catch(() => false),
+          fetchConfigs().catch(() => false),
+          fetchCurrentSub().catch(() => null),
+        ])
+      } else {
+        setPostprocessMessage('托管后处理已保存；下次订阅切换/应用会自动叠加，或可手动部署。')
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '托管后处理保存失败')
+    } finally {
+      setPostprocessLoading(false)
+    }
+  }
+
+  const applyPostprocess = async () => {
+    setError(null)
+    setPostprocessMessage(null)
+    setPostprocessLoading(true)
+    try {
+      const r = await fetch(`${API}/postprocess/claude-residential/apply`, { method: 'POST' })
+      const data = await r.json().catch(() => ({})) as Partial<ManagedPostprocess> & { detail?: string; deployment?: ManagedDeployment | null }
+      if (!r.ok) throw new Error(typeof data.detail === 'string' ? data.detail : r.statusText)
+      setPostprocessFromApi(data as ManagedPostprocess)
+      setPostprocessMessage(
+        data.deployment?.hot_reloaded
+          ? '已从当前原始订阅缓存重新部署并热重载。'
+          : '配置已写入，但 Clash 未确认热重载。'
+      )
+      await Promise.all([
+        fetchProxies().catch(() => false),
+        fetchConfigs().catch(() => false),
+        fetchCurrentSub().catch(() => null),
+      ])
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '托管后处理部署失败')
+    } finally {
+      setPostprocessLoading(false)
+    }
+  }
+
   const testDelay = async (nodeName: string) => {
     setDelayTestingNodes((prev) => ({ ...prev, [nodeName]: true }))
     try {
@@ -633,7 +820,7 @@ function App() {
 
   const testAllDelays = async () => {
     const allNodeNames = Array.from(new Set(
-      displayGroups.flatMap(([_, p]) => p.all ?? [])
+      displayGroups.flatMap(([, p]) => p.all ?? [])
     ))
     if (allNodeNames.length === 0) return
     setError(null)
@@ -657,7 +844,7 @@ function App() {
 
   const allGroups = proxies
     ? Object.entries(proxies.proxies || {}).filter(
-        ([_, p]) => p.all && p.all.length > 0 && p.type === 'Selector'
+        ([, p]) => p.all && p.all.length > 0 && p.type === 'Selector'
       )
     : []
 
@@ -691,7 +878,7 @@ function App() {
 
   const directProxies =
     clashMode === 'direct' && proxies?.proxies
-      ? Object.entries(proxies.proxies).filter(([_, p]) => {
+      ? Object.entries(proxies.proxies).filter(([, p]) => {
           const t = (p.type || '').toLowerCase()
           return t === 'direct' || t === 'reject'
         })
@@ -718,6 +905,13 @@ function App() {
             onClick={() => setTab('nodes')}
           >
             节点选择
+          </button>
+          <button
+            type="button"
+            className={tab === 'routing' ? 'active' : ''}
+            onClick={() => setTab('routing')}
+          >
+            Claude 后处理
           </button>
           <button
             type="button"
@@ -1009,6 +1203,209 @@ function App() {
                 </div>
               </section>
             )}
+            </div>
+          </div>
+        )}
+
+        {tab === 'routing' && (
+          <div className="tab-page">
+            <h1 className="main-title">Claude 后处理</h1>
+            <div className="tab-body">
+              <section className="settings-panel managed-routing-panel">
+                <p className="settings-desc">
+                  仅为列出的精确域名添加一条托管链路：当前订阅中已选节点 → 住宅 SOCKS5。订阅原始缓存不写入这层配置；刷新、切换和应用时都会重新叠加。
+                </p>
+                {postprocessMessage && <p className="settings-message">{postprocessMessage}</p>}
+                {postprocess && (
+                  <>
+                    <div className={`managed-routing-status ${postprocess.active_in_current_mode ? 'active' : 'inactive'}`}>
+                      <span className="managed-routing-status-label">
+                        {postprocess.active_in_current_mode
+                          ? 'Rule 路由已生效'
+                          : postprocess.enabled
+                            ? `当前 ${postprocess.current_mode}，规则链未接管流量`
+                            : '后处理已关闭'}
+                      </span>
+                      <span>精确规则 {postprocess.managed_rule_count}/{postprocess.domains.length}</span>
+                      {postprocess.resolved_upstream_group && (
+                        <span title="托管 relay 的第一跳">上游组：{postprocess.resolved_upstream_group}</span>
+                      )}
+                    </div>
+                    <p className="managed-routing-mode-note">
+                      {postprocess.mode_note[postprocess.current_mode]}
+                    </p>
+                    <p className="managed-routing-mode-note">
+                      {postprocess.non_target_behavior_note}
+                    </p>
+                    {postprocess.upstream_error && (
+                      <p className="managed-routing-warning">当前订阅无法解析上游组：{postprocess.upstream_error}</p>
+                    )}
+                  </>
+                )}
+                {postprocessDraft && postprocess && (
+                  <div className="settings-form managed-routing-form">
+                    <label className="settings-checkbox">
+                      <input
+                        type="checkbox"
+                        checked={postprocessDraft.enabled}
+                        disabled={postprocessLoading}
+                        onChange={(e) => setPostprocessDraft((prev) => prev ? { ...prev, enabled: e.target.checked } : prev)}
+                      />
+                      <span>启用 Claude 精确域名后处理</span>
+                    </label>
+
+                    <label className="settings-field managed-routing-domains">
+                      <span>精确域名（每行一个，不匹配子域名）</span>
+                      <textarea
+                        value={postprocessDraft.domainsText}
+                        spellCheck={false}
+                        disabled={postprocessLoading}
+                        onChange={(e) => setPostprocessDraft((prev) => prev ? { ...prev, domainsText: e.target.value } : prev)}
+                      />
+                    </label>
+
+                    <label className="settings-field">
+                      <span>订阅上游选择组</span>
+                      <input
+                        list="managed-upstream-group-options"
+                        value={postprocessDraft.upstream_group}
+                        disabled={postprocessLoading}
+                        placeholder="留空：自动选择订阅中的首个可选节点组"
+                        onChange={(e) => setPostprocessDraft((prev) => prev ? { ...prev, upstream_group: e.target.value } : prev)}
+                      />
+                      <datalist id="managed-upstream-group-options">
+                        {postprocess.available_upstream_groups.map((group) => <option key={group} value={group} />)}
+                      </datalist>
+                      <small>留空会随不同订阅自动寻找可选节点组；填写后会严格校验该组仍存在。</small>
+                    </label>
+
+                    <label className="settings-field">
+                      <span>其余流量策略</span>
+                      <select
+                        value={postprocessDraft.non_target_behavior}
+                        disabled={postprocessLoading}
+                        onChange={(e) => setPostprocessDraft((prev) => prev ? {
+                          ...prev,
+                          non_target_behavior: e.target.value === 'global_passthrough'
+                            ? 'global_passthrough'
+                            : 'subscription_rules',
+                        } : prev)}
+                      >
+                        <option value="global_passthrough">保持原 Global 行为（其余流量走 GLOBAL）</option>
+                        <option value="subscription_rules">使用订阅原始 Rule 行为</option>
+                      </select>
+                      <small>
+                        选择“保持原 Global”时，保存会切到 Rule 以让 15 条精确规则生效，并紧接着以 MATCH,GLOBAL 保持所有其余流量的原出口选择。
+                      </small>
+                    </label>
+
+                    <div className="managed-routing-grid">
+                      <label className="settings-field">
+                        <span>住宅 SOCKS5 地址</span>
+                        <input
+                          type="text"
+                          autoComplete="off"
+                          value={postprocessDraft.server}
+                          disabled={postprocessLoading || !postprocessDraft.enabled}
+                          onChange={(e) => setPostprocessDraft((prev) => prev ? { ...prev, server: e.target.value } : prev)}
+                        />
+                      </label>
+                      <label className="settings-field">
+                        <span>端口</span>
+                        <input
+                          type="number"
+                          min={1}
+                          max={65535}
+                          value={postprocessDraft.port ?? ''}
+                          disabled={postprocessLoading || !postprocessDraft.enabled}
+                          onChange={(e) => setPostprocessDraft((prev) => prev ? {
+                            ...prev,
+                            port: e.target.value === '' ? null : Number(e.target.value),
+                          } : prev)}
+                        />
+                      </label>
+                    </div>
+                    <label className="settings-field">
+                      <span>用户名</span>
+                      <input
+                        type="text"
+                        autoComplete="off"
+                        value={postprocessDraft.username}
+                        disabled={postprocessLoading || !postprocessDraft.enabled}
+                        onChange={(e) => setPostprocessDraft((prev) => prev ? { ...prev, username: e.target.value } : prev)}
+                      />
+                    </label>
+                    <label className="settings-field">
+                      <span>密码</span>
+                      <input
+                        type="password"
+                        autoComplete="new-password"
+                        value={postprocessDraft.password}
+                        disabled={postprocessLoading || !postprocessDraft.enabled}
+                        placeholder={postprocess.residential.password_configured ? '已保存；留空保持不变' : '首次启用时必填'}
+                        onChange={(e) => setPostprocessDraft((prev) => prev ? { ...prev, password: e.target.value } : prev)}
+                      />
+                      <small>
+                        {postprocess.residential.password_configured
+                          ? '密码已保存且不会回传或显示在页面中。'
+                          : '密码仅在保存时发送；页面不会读取回显值。'}
+                      </small>
+                    </label>
+
+                    <p className="managed-routing-scope">
+                      只有上方精确域名会先进入该 relay；不会匹配子域名。切换到 Global 或 Direct 会绕过这些规则；保存不会重启 Clash。
+                    </p>
+                    <div className="settings-actions managed-routing-actions">
+                      <button
+                        type="button"
+                        onClick={() => void savePostprocess(true)}
+                        disabled={postprocessLoading}
+                      >
+                        {postprocessLoading ? '保存中…' : '保存并热重载'}
+                      </button>
+                      <button
+                        type="button"
+                        className="settings-reset"
+                        onClick={() => void savePostprocess(false)}
+                        disabled={postprocessLoading}
+                      >
+                        仅保存
+                      </button>
+                      <button
+                        type="button"
+                        className="settings-reset"
+                        onClick={() => void applyPostprocess()}
+                        disabled={postprocessLoading}
+                      >
+                        从当前缓存重新部署
+                      </button>
+                      {hasPostprocessChanges && (
+                        <button
+                          type="button"
+                          className="settings-reset"
+                          onClick={() => {
+                            setPostprocessDraft({
+                              enabled: postprocess.enabled,
+                              domainsText: postprocess.domains.join('\n'),
+                              upstream_group: postprocess.upstream_group,
+                              non_target_behavior: postprocess.non_target_behavior,
+                              server: postprocess.residential.server,
+                              port: postprocess.residential.port,
+                              username: postprocess.residential.username,
+                              password: '',
+                            })
+                            setPostprocessMessage(null)
+                          }}
+                          disabled={postprocessLoading}
+                        >
+                          撤销未保存修改
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+                {!postprocessDraft && <p className="empty">正在读取托管后处理配置…</p>}
+              </section>
             </div>
           </div>
         )}

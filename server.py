@@ -6,13 +6,18 @@ Clash 订阅管理 + 节点切换后端
 """
 import asyncio
 import copy
+import ipaddress
 import json
 import os
+import re
+import shutil
 import signal
 import ssl
 import subprocess
+import tempfile
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 from urllib.parse import urlparse
@@ -33,6 +38,105 @@ CLASH_LOG = Path(__file__).resolve().parent / "logs" / "clash.log"
 TRAFFIC_LOG_DIR = Path(__file__).resolve().parent / "logs"
 DEFAULT_CLASH_CONFIG_YAML = Path(__file__).resolve().parent / "default_clash_config.yaml"
 RUNTIME_STATE_FILE = Path(__file__).resolve().parent / "runtime_state.json"
+MANAGED_POSTPROCESS_FILE = Path(__file__).resolve().parent / "managed_postprocess.json"
+DEPLOYMENT_BACKUP_DIR = Path(__file__).resolve().parent / "deployment_backups"
+
+# These names are deliberately internal/reserved.  They are stripped before a
+# cached subscription is reapplied, so an upstream refresh never accumulates a
+# second copy of the managed chain.
+MANAGED_PREFIX = "__manager_claude_"
+MANAGED_RESIDENTIAL_PROXY = "__manager_claude_residential_socks5"
+MANAGED_RELAY_GROUP = "__manager_claude_residential_chain"
+PRIVATE_FILE_MODE = 0o600
+PRIVATE_DIR_MODE = 0o700
+
+# Exact host matches only.  Do not turn these into DOMAIN-SUFFIX rules: several
+# of these hosts deliberately need a different route from their subdomains.
+DEFAULT_CLAUDE_DOMAINS = (
+    "claude.ai",
+    "claude.com",
+    "platform.claude.com",
+    "api.anthropic.com",
+    "www.anthropic.com",
+    "console.anthropic.com",
+    "clau.de",
+    "claude.dev",
+    "claudeusercontent.com",
+    "check.claudemcpcontent.com",
+    "anthropic.auth0.com",
+    "hcaptcha.com",
+    "challenges.cloudflare.com",
+    "claude-check.caixukun.de",
+    "anthropic-check.caixukun.de",
+)
+_DOMAIN_RE = re.compile(
+    r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\Z"
+)
+
+
+def _restrict_file(path: Path, mode: int = PRIVATE_FILE_MODE) -> None:
+    """Best-effort restrictive permissions; a permission error must not leak contents."""
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
+def _ensure_private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path, PRIVATE_DIR_MODE)
+    except OSError:
+        pass
+
+
+def _write_private_text(path: Path, text: str) -> None:
+    """Atomically write sensitive runtime data with owner-only permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = -1
+    temp_name = ""
+    try:
+        fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        os.fchmod(fd, PRIVATE_FILE_MODE)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = -1
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_name, path)
+        temp_name = ""
+        _restrict_file(path)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if temp_name:
+            try:
+                Path(temp_name).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _write_private_json(path: Path, value: object) -> None:
+    _write_private_text(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def _secure_existing_runtime_files() -> None:
+    """Tighten existing manager-owned state without touching unrelated services."""
+    for state_file in (SUBS_FILE, CURRENT_SUB_FILE, RUNTIME_STATE_FILE, MANAGED_POSTPROCESS_FILE):
+        if state_file.exists():
+            _restrict_file(state_file)
+
+    _ensure_private_dir(PROFILE_CACHE_DIR)
+    for cache_file in PROFILE_CACHE_DIR.glob("*.yaml"):
+        _restrict_file(cache_file)
+
+    config_path = Path(config.CLASH_CONFIG_PATH)
+    if config_path.exists():
+        _restrict_file(config_path)
+        try:
+            os.chmod(config_path.parent, PRIVATE_DIR_MODE)
+        except OSError:
+            pass
 
 
 def _get_current_sub_id() -> int | None:
@@ -50,8 +154,7 @@ def _set_current_sub_id(sub_id: int | None) -> None:
     if sub_id is None:
         CURRENT_SUB_FILE.unlink(missing_ok=True)
         return
-    with open(CURRENT_SUB_FILE, "w", encoding="utf-8") as f:
-        json.dump({"current_id": sub_id}, f)
+    _write_private_json(CURRENT_SUB_FILE, {"current_id": sub_id})
 
 
 def _load_runtime_state() -> dict:
@@ -75,14 +178,16 @@ def _save_runtime_state(data: dict) -> None:
     selected = payload.get("selected_proxies")
     if not isinstance(selected, dict):
         payload["selected_proxies"] = {}
-    with open(RUNTIME_STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    _write_private_json(RUNTIME_STATE_FILE, payload)
 
 
 def _clash_alive() -> bool:
     try:
         base = config.CLASH_API_BASE.rstrip("/")
-        r = httpx.get(f"{base}/version", timeout=2.0)
+        # The manager talks to a loopback controller.  Inheriting HTTP_PROXY
+        # here can route that control request back into Clash (or a corporate
+        # proxy) and turn a healthy controller into a misleading 502.
+        r = httpx.get(f"{base}/version", timeout=2.0, trust_env=False)
         return r.is_success
     except Exception:
         return False
@@ -128,11 +233,8 @@ def _effective_clash_yaml() -> dict:
 
 def _write_clash_yaml(data: dict) -> None:
     path = Path(config.CLASH_CONFIG_PATH)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
-    )
+    _ensure_private_dir(path.parent)
+    _write_private_text(path, yaml.safe_dump(data, allow_unicode=True, sort_keys=False))
 
 
 def _current_mixed_port() -> int:
@@ -185,10 +287,12 @@ def _tls_eof_like_error(msg: str) -> bool:
 
 def _httpx_client_kwargs_for_subscription_fetch() -> dict:
     """订阅从网络刷新时的出站 HTTP：可选经本机 Clash mixed-port。"""
-    opts: dict = dict(timeout=60.0, follow_redirects=True)
+    # A subscription must be direct unless the existing UI preference explicitly
+    # enables the local Clash proxy.  Do not silently inherit the manager
+    # process's HTTP_PROXY/HTTPS_PROXY environment.
+    opts: dict = dict(timeout=60.0, follow_redirects=True, trust_env=False)
     if _subscription_via_clash_proxy_enabled():
         opts["proxy"] = _proxy_url()
-        opts["trust_env"] = False
         # 与站点连通性测试一致：经本地代理时关掉 keep-alive，减轻 TLS 半截关闭 / 坏连接复用导致的
         # [SSL: UNEXPECTED_EOF_WHILE_READING]。
         opts["limits"] = httpx.Limits(max_connections=10, max_keepalive_connections=0)
@@ -358,6 +462,7 @@ async def _traffic_log_task():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _secure_existing_runtime_files()
     # 启动时若 Clash 未运行则启动
     if not _clash_alive():
         _start_clash()
@@ -409,6 +514,533 @@ class RuntimeConfigUpdate(BaseModel):
     bind_address: str
 
 
+class ResidentialProxyUpdate(BaseModel):
+    server: str = ""
+    port: int | None = None
+    username: str = ""
+    # Omitted means "keep the stored password".  It is never returned by GET.
+    password: str | None = None
+
+
+class ClaudeResidentialPostprocessUpdate(BaseModel):
+    enabled: bool = True
+    domains: list[str]
+    upstream_group: str = ""
+    # global_passthrough means: turn on Rule mode for the exact domains, then
+    # send every other request through Clash's virtual GLOBAL selector.  This
+    # preserves a pre-existing Global-mode decision for non-target traffic.
+    non_target_behavior: str | None = None
+    residential: ResidentialProxyUpdate
+    # Saving independently from applying is useful while a user is editing a
+    # live profile with active connections.
+    apply_now: bool = True
+
+
+def _default_postprocess_settings() -> dict:
+    return {
+        "version": 1,
+        "enabled": False,
+        "domains": list(DEFAULT_CLAUDE_DOMAINS),
+        "upstream_group": "",
+        "non_target_behavior": "subscription_rules",
+        "residential": {
+            "server": "",
+            "port": None,
+            "username": "",
+            "password": "",
+        },
+    }
+
+
+def _normalize_exact_domains(values: object) -> list[str]:
+    if not isinstance(values, list):
+        raise HTTPException(status_code=422, detail="精确域名必须是列表")
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        if not isinstance(raw, str):
+            raise HTTPException(status_code=422, detail="精确域名必须是文本")
+        domain = raw.strip().lower().rstrip(".")
+        if not _DOMAIN_RE.fullmatch(domain):
+            raise HTTPException(status_code=422, detail="域名必须是精确主机名，不能包含通配符、协议或路径")
+        if domain not in seen:
+            seen.add(domain)
+            out.append(domain)
+    if not out:
+        raise HTTPException(status_code=422, detail="至少保留一个精确域名")
+    if len(out) > 64:
+        raise HTTPException(status_code=422, detail="精确域名数量不能超过 64 个")
+    return out
+
+
+def _normalize_proxy_server(raw: object) -> str:
+    if not isinstance(raw, str):
+        raise HTTPException(status_code=422, detail="住宅 SOCKS5 地址必须是文本")
+    server = raw.strip().lower()
+    if not server:
+        raise HTTPException(status_code=422, detail="启用后处理时必须填写住宅 SOCKS5 地址")
+    try:
+        ipaddress.ip_address(server)
+        return server
+    except ValueError:
+        pass
+    if not _DOMAIN_RE.fullmatch(server):
+        raise HTTPException(status_code=422, detail="住宅 SOCKS5 地址必须是 IP 或主机名")
+    return server
+
+
+def _load_postprocess_settings() -> dict:
+    defaults = _default_postprocess_settings()
+    if not MANAGED_POSTPROCESS_FILE.exists():
+        return defaults
+    try:
+        raw = json.loads(MANAGED_POSTPROCESS_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="托管后处理状态无法读取；未改动当前 Clash 配置") from exc
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=500, detail="托管后处理状态格式无效；未改动当前 Clash 配置")
+
+    result = _default_postprocess_settings()
+    result["enabled"] = bool(raw.get("enabled", False))
+    domains = raw.get("domains", result["domains"])
+    try:
+        result["domains"] = _normalize_exact_domains(domains)
+    except HTTPException as exc:
+        raise HTTPException(status_code=500, detail="托管后处理中的域名格式无效；未改动当前 Clash 配置") from exc
+
+    group = raw.get("upstream_group", "")
+    if not isinstance(group, str) or len(group.strip()) > 256 or "\n" in group or "\r" in group:
+        raise HTTPException(status_code=500, detail="托管后处理中的上游组名称无效；未改动当前 Clash 配置")
+    result["upstream_group"] = group.strip()
+
+    behavior = raw.get("non_target_behavior")
+    if behavior is None:
+        # State written before this field existed is upgraded according to the
+        # behavior users were actually receiving at the time: Global mode.
+        active_mode = str(_effective_clash_yaml().get("mode", "rule"))
+        behavior = "global_passthrough" if result["enabled"] and active_mode == "global" else "subscription_rules"
+    if behavior not in {"subscription_rules", "global_passthrough"}:
+        raise HTTPException(status_code=500, detail="托管后处理中的非目标流量策略无效；未改动当前 Clash 配置")
+    result["non_target_behavior"] = behavior
+
+    residential = raw.get("residential")
+    if isinstance(residential, dict):
+        server = residential.get("server", "")
+        username = residential.get("username", "")
+        password = residential.get("password", "")
+        port = residential.get("port")
+        result["residential"] = {
+            "server": server.strip() if isinstance(server, str) else "",
+            "port": port if isinstance(port, int) and not isinstance(port, bool) else None,
+            "username": username.strip() if isinstance(username, str) else "",
+            "password": password if isinstance(password, str) else "",
+        }
+    return result
+
+
+def _save_postprocess_settings(settings: dict) -> None:
+    _write_private_json(MANAGED_POSTPROCESS_FILE, settings)
+
+
+def _settings_from_postprocess_update(body: ClaudeResidentialPostprocessUpdate) -> dict:
+    previous = _load_postprocess_settings()
+    domains = _normalize_exact_domains(body.domains)
+    upstream_group = body.upstream_group.strip()
+    if len(upstream_group) > 256 or "\n" in upstream_group or "\r" in upstream_group:
+        raise HTTPException(status_code=422, detail="上游订阅组名称无效")
+    if upstream_group.startswith(MANAGED_PREFIX):
+        raise HTTPException(status_code=422, detail="上游订阅组不能引用 Manager 托管组")
+    behavior = body.non_target_behavior or previous.get("non_target_behavior")
+    if behavior not in {"subscription_rules", "global_passthrough"}:
+        raise HTTPException(status_code=422, detail="非目标流量策略无效")
+
+    incoming = body.residential
+    password = previous["residential"]["password"] if incoming.password is None else incoming.password
+    if not isinstance(password, str) or "\n" in password or "\r" in password:
+        raise HTTPException(status_code=422, detail="住宅 SOCKS5 密码格式无效")
+
+    server = incoming.server.strip()
+    username = incoming.username.strip()
+    port = incoming.port
+    if body.enabled:
+        server = _normalize_proxy_server(server)
+        if port is None or isinstance(port, bool) or port < 1 or port > 65535:
+            raise HTTPException(status_code=422, detail="住宅 SOCKS5 端口必须在 1-65535 之间")
+        if not username:
+            raise HTTPException(status_code=422, detail="启用后处理时必须填写住宅 SOCKS5 用户名")
+        if not password:
+            raise HTTPException(status_code=422, detail="请填写住宅 SOCKS5 密码（留空只会保留已保存的密码）")
+
+    return {
+        "version": 1,
+        "enabled": bool(body.enabled),
+        "domains": domains,
+        "upstream_group": upstream_group,
+        "non_target_behavior": behavior,
+        "residential": {
+            "server": server,
+            "port": port,
+            "username": username,
+            "password": password,
+        },
+    }
+
+
+def _groups_key_and_value(clash_data: dict) -> tuple[str, list[dict]]:
+    for key in ("proxy-groups", "proxy_groups"):
+        value = clash_data.get(key)
+        if isinstance(value, list):
+            groups = [item for item in value if isinstance(item, dict)]
+            if len(groups) != len(value):
+                raise HTTPException(status_code=422, detail="订阅中的代理组结构无效")
+            return key, groups
+    raise HTTPException(status_code=422, detail="订阅中没有可用的代理组，无法构建托管链路")
+
+
+def _is_managed_rule(rule: object) -> bool:
+    if not isinstance(rule, str):
+        return False
+    parts = [part.strip() for part in rule.split(",")]
+    return MANAGED_RELAY_GROUP in parts[2:]
+
+
+def _strip_managed_postprocess(clash_data: dict) -> dict:
+    """Return a source-shaped config without only this manager's generated artifacts."""
+    clean = copy.deepcopy(clash_data)
+    proxies = clean.get("proxies")
+    if isinstance(proxies, list):
+        clean["proxies"] = [
+            item
+            for item in proxies
+            if not (isinstance(item, dict) and str(item.get("name", "")).startswith(MANAGED_PREFIX))
+        ]
+    for key in ("proxy-groups", "proxy_groups"):
+        groups = clean.get(key)
+        if isinstance(groups, list):
+            clean[key] = [
+                item
+                for item in groups
+                if not (isinstance(item, dict) and str(item.get("name", "")).startswith(MANAGED_PREFIX))
+            ]
+    rules = clean.get("rules")
+    if isinstance(rules, list):
+        clean["rules"] = [rule for rule in rules if not _is_managed_rule(rule)]
+    return clean
+
+
+def _available_upstream_groups(clash_data: dict) -> list[str]:
+    _, groups = _groups_key_and_value(clash_data)
+    names: list[str] = []
+    for group in groups:
+        name = group.get("name")
+        if isinstance(name, str) and name and not name.startswith(MANAGED_PREFIX):
+            names.append(name)
+    return names
+
+
+def _resolve_upstream_group(clash_data: dict, configured_name: str) -> str:
+    """Find the subscription selector that represents the user's chosen node."""
+    _, groups = _groups_key_and_value(clash_data)
+    by_name = {
+        str(group["name"]): group
+        for group in groups
+        if isinstance(group.get("name"), str) and group.get("name")
+    }
+    group_names = set(by_name)
+
+    def is_selectable(group: dict) -> bool:
+        return str(group.get("type", "")).lower() == "select"
+
+    def has_concrete_member(group: dict) -> bool:
+        members = group.get("proxies")
+        if not isinstance(members, list):
+            return bool(group.get("use"))
+        return any(
+            isinstance(member, str)
+            and member not in group_names
+            and member.upper() not in {"DIRECT", "REJECT", "REJECT-DROP"}
+            for member in members
+        ) or bool(group.get("use"))
+
+    if configured_name:
+        group = by_name.get(configured_name)
+        if group is None:
+            raise HTTPException(status_code=422, detail="所选上游订阅组不在当前订阅中")
+        if not is_selectable(group):
+            raise HTTPException(status_code=422, detail="上游订阅组必须是 select 类型，才能跟随已选节点")
+        return configured_name
+
+    for group in groups:
+        if is_selectable(group) and has_concrete_member(group):
+            return str(group["name"])
+    for group in groups:
+        if is_selectable(group):
+            return str(group["name"])
+    raise HTTPException(status_code=422, detail="订阅中没有可跟随已选节点的 select 代理组")
+
+
+def _assert_upstream_has_no_manager_cycle(clash_data: dict, upstream_group: str) -> None:
+    _, groups = _groups_key_and_value(clash_data)
+    by_name = {
+        str(group["name"]): group
+        for group in groups
+        if isinstance(group.get("name"), str) and group.get("name")
+    }
+    pending = [upstream_group]
+    visited: set[str] = set()
+    while pending:
+        name = pending.pop()
+        if name in visited:
+            continue
+        visited.add(name)
+        if name.startswith(MANAGED_PREFIX):
+            raise HTTPException(status_code=422, detail="上游订阅组不能经由 Manager 托管组，避免代理循环")
+        group = by_name.get(name)
+        if not group:
+            continue
+        members = group.get("proxies")
+        if isinstance(members, list):
+            for member in members:
+                if not isinstance(member, str):
+                    continue
+                if member.startswith(MANAGED_PREFIX):
+                    raise HTTPException(status_code=422, detail="上游订阅组不能经由 Manager 托管组，避免代理循环")
+                if member in by_name:
+                    pending.append(member)
+
+
+def _build_deployed_clash_dict(raw_clash_data: dict, settings: dict | None = None) -> tuple[dict, str | None]:
+    """Overlay the managed relay on a raw subscription without modifying that raw source."""
+    if not isinstance(raw_clash_data, dict):
+        raise HTTPException(status_code=422, detail="订阅配置结构无效")
+    managed_settings = settings if settings is not None else _load_postprocess_settings()
+    deployed = _strip_managed_postprocess(raw_clash_data)
+    _merge_runtime_into_clash_dict(deployed)
+    if not managed_settings.get("enabled"):
+        return deployed, None
+
+    proxies = deployed.get("proxies")
+    if proxies is None:
+        proxies = []
+        deployed["proxies"] = proxies
+    if not isinstance(proxies, list) or not all(isinstance(item, dict) for item in proxies):
+        raise HTTPException(status_code=422, detail="订阅中的代理节点结构无效")
+
+    groups_key, groups = _groups_key_and_value(deployed)
+    upstream_group = _resolve_upstream_group(deployed, str(managed_settings.get("upstream_group") or ""))
+    _assert_upstream_has_no_manager_cycle(deployed, upstream_group)
+    residential = managed_settings.get("residential")
+    if not isinstance(residential, dict):
+        raise HTTPException(status_code=500, detail="住宅 SOCKS5 状态无效；未改动当前 Clash 配置")
+
+    deployed["proxies"] = [
+        *proxies,
+        {
+            "name": MANAGED_RESIDENTIAL_PROXY,
+            "type": "socks5",
+            "server": residential["server"],
+            "port": residential["port"],
+            "username": residential["username"],
+            "password": residential["password"],
+            "udp": False,
+        },
+    ]
+    deployed[groups_key] = [
+        *groups,
+        {
+            "name": MANAGED_RELAY_GROUP,
+            "type": "relay",
+            # The first hop is the subscription's select group, so a node
+            # choice in that group remains the first hop of this chain.
+            "proxies": [upstream_group, MANAGED_RESIDENTIAL_PROXY],
+        },
+    ]
+    rules = deployed.get("rules")
+    if rules is None:
+        rules = []
+    if not isinstance(rules, list):
+        raise HTTPException(status_code=422, detail="订阅中的规则结构无效")
+    managed_rules = [
+        *(f"DOMAIN,{domain},{MANAGED_RELAY_GROUP}" for domain in managed_settings["domains"]),
+    ]
+    if managed_settings.get("non_target_behavior") == "global_passthrough":
+        # Original Clash exposes GLOBAL as a virtual selector.  Rule mode is
+        # needed for the exact-domain override, while this immediate fallback
+        # preserves the current Global-mode choice for every other request.
+        deployed["mode"] = "rule"
+        managed_rules.append("MATCH,GLOBAL")
+    deployed["rules"] = [*managed_rules, *rules]
+    return deployed, upstream_group
+
+
+def _validate_generated_clash_config(clash_data: dict) -> None:
+    """Use the installed original Clash binary to reject bad generated YAML before writing it live."""
+    try:
+        with tempfile.TemporaryDirectory(prefix="clash-manager-validate-") as temp_dir:
+            validation_path = Path(temp_dir) / "config.yaml"
+            _write_private_text(
+                validation_path,
+                yaml.safe_dump(clash_data, allow_unicode=True, sort_keys=False),
+            )
+            result = subprocess.run(
+                [config.CLASH_BIN, "-t", "-f", str(validation_path), "-d", config.CLASH_CONFIG_DIR],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise HTTPException(status_code=503, detail="无法完成本地 Clash 配置校验；未写入当前配置") from exc
+    if result.returncode != 0:
+        # Validator output can include upstream node details, so return only a
+        # generic diagnostic to the API/UI and never log it.
+        raise HTTPException(status_code=422, detail="生成的 Clash 配置未通过本地原版 Clash 校验；未写入当前配置")
+
+
+def _backup_current_clash_config() -> bool:
+    source = Path(config.CLASH_CONFIG_PATH)
+    if not source.is_file():
+        return False
+    _ensure_private_dir(DEPLOYMENT_BACKUP_DIR)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    destination = DEPLOYMENT_BACKUP_DIR / f"config-before-managed-deploy-{stamp}-{time.time_ns()}.yaml"
+    try:
+        shutil.copyfile(source, destination)
+        _restrict_file(destination)
+        return True
+    except OSError:
+        raise HTTPException(status_code=503, detail="无法创建当前 Clash 配置备份；未写入新配置")
+
+
+def _hot_reload_clash() -> bool:
+    try:
+        # Original Clash's PUT /configs requires a JSON object.  An empty PUT
+        # is a 400 and leaves the on-disk file out of sync with the live core.
+        response = _clash_request(
+            "PUT",
+            "/configs",
+            json={"path": str(Path(config.CLASH_CONFIG_PATH).resolve())},
+        )
+        response.raise_for_status()
+        _restore_persisted_proxy_selections()
+        return True
+    except Exception:
+        return False
+
+
+def _capture_runtime_proxy_selections() -> None:
+    """Preserve live selector choices (including virtual GLOBAL) across a hot reload."""
+    try:
+        response = _clash_request("GET", "/proxies")
+        response.raise_for_status()
+        proxies = (response.json() or {}).get("proxies", {})
+    except Exception:
+        return
+    if not isinstance(proxies, dict):
+        return
+    selected: dict[str, str] = {}
+    for group_name, group in proxies.items():
+        if not isinstance(group_name, str) or not isinstance(group, dict):
+            continue
+        if str(group.get("type", "")).lower() != "selector":
+            continue
+        current = group.get("now")
+        members = group.get("all")
+        if isinstance(current, str) and isinstance(members, list) and current in members:
+            selected[group_name] = current
+    if not selected:
+        return
+    state = _load_runtime_state()
+    remembered = dict(state.get("selected_proxies", {}))
+    remembered.update(selected)
+    state["selected_proxies"] = remembered
+    _save_runtime_state(state)
+
+
+def _deploy_raw_clash_config(
+    raw_clash_data: dict,
+    *,
+    current_sub_id: int | None,
+    ok_message: str,
+) -> dict:
+    settings = _load_postprocess_settings()
+    # Persist one-time schema upgrades (notably the Global compatibility
+    # choice) before the active config's mode is changed by this deployment.
+    if MANAGED_POSTPROCESS_FILE.exists():
+        _save_postprocess_settings(settings)
+    deployed, upstream_group = _build_deployed_clash_dict(raw_clash_data, settings)
+    _validate_generated_clash_config(deployed)
+
+    config_path = Path(config.CLASH_CONFIG_PATH)
+    previous = _load_clash_config_yaml(config_path) if config_path.exists() else None
+    changed = previous != deployed
+    backup_created = _backup_current_clash_config() if changed else False
+    if changed:
+        _capture_runtime_proxy_selections()
+        _write_clash_yaml(deployed)
+    elif config_path.exists():
+        _restrict_file(config_path)
+
+    # An explicit deploy also repairs a possible disk/runtime mismatch left by
+    # an older Manager version, while remaining a non-force Clash hot reload.
+    hot_reloaded = _hot_reload_clash()
+    if current_sub_id is not None:
+        _set_current_sub_id(current_sub_id)
+    return {
+        "ok": True,
+        "message": ok_message,
+        "deployment_changed": changed,
+        "backup_created": backup_created,
+        "hot_reloaded": hot_reloaded,
+        "upstream_group": upstream_group,
+    }
+
+
+def _current_raw_config_for_postprocess() -> tuple[dict, int | None, str]:
+    current_id = _get_current_sub_id()
+    if current_id is not None:
+        cached = _subscription_cache_file(current_id)
+        if cached.is_file():
+            raw = _load_clash_config_yaml(cached)
+            if isinstance(raw, dict):
+                return raw, current_id, "subscription_cache"
+    active = _load_clash_config_yaml(Path(config.CLASH_CONFIG_PATH))
+    if not isinstance(active, dict):
+        raise HTTPException(status_code=503, detail="当前 Clash 配置无法读取；未写入任何变更")
+    # The active file may already include the generated overlay; stripping it
+    # makes this fallback idempotent without altering any stored raw cache.
+    return _strip_managed_postprocess(active), current_id, "active_config"
+
+
+def _managed_postprocess_status(settings: dict, active_config: dict | None) -> dict:
+    mode = str((active_config or {}).get("mode", "rule"))
+    proxy_names = {
+        str(item.get("name"))
+        for item in ((active_config or {}).get("proxies") or [])
+        if isinstance(item, dict)
+    }
+    group_names: set[str] = set()
+    if isinstance(active_config, dict):
+        try:
+            _, groups = _groups_key_and_value(active_config)
+            group_names = {str(group.get("name")) for group in groups}
+        except HTTPException:
+            group_names = set()
+    managed_rule_count = sum(
+        1 for rule in ((active_config or {}).get("rules") or []) if _is_managed_rule(rule)
+    )
+    installed = (
+        MANAGED_RESIDENTIAL_PROXY in proxy_names
+        and MANAGED_RELAY_GROUP in group_names
+        and managed_rule_count == len(settings["domains"])
+    )
+    return {
+        "current_mode": mode,
+        "installed_in_active_config": installed,
+        "active_in_current_mode": bool(settings.get("enabled") and installed and mode == "rule"),
+        "managed_rule_count": managed_rule_count,
+    }
+
+
 def _load_subs() -> list[dict]:
     if not SUBS_FILE.exists():
         return []
@@ -417,15 +1049,16 @@ def _load_subs() -> list[dict]:
 
 
 def _save_subs(subs: list[dict]) -> None:
-    with open(SUBS_FILE, "w", encoding="utf-8") as f:
-        json.dump(subs, f, ensure_ascii=False, indent=2)
+    _write_private_json(SUBS_FILE, subs)
 
 
 # ---------- Clash API 代理 ----------
 def _clash_request(method: str, path: str, **kwargs) -> httpx.Response:
     base = config.CLASH_API_BASE.rstrip("/")
     url = f"{base}{path}"
-    with httpx.Client(timeout=30.0) as c:
+    # Control-plane requests must never recurse through this process's
+    # HTTP(S)_PROXY environment.  The controller is a local manager resource.
+    with httpx.Client(timeout=30.0, trust_env=False) as c:
         return c.request(method, url, **kwargs)
 
 
@@ -468,8 +1101,6 @@ def update_clash_runtime_config(body: RuntimeConfigUpdate):
     if not bind_address:
         raise HTTPException(status_code=400, detail="bind_address 不能为空")
 
-    path = Path(config.CLASH_CONFIG_PATH)
-    path.parent.mkdir(parents=True, exist_ok=True)
     data = _effective_clash_yaml()
     changed = (
         int(data.get("mixed-port", 7890)) != body.mixed_port
@@ -480,10 +1111,7 @@ def update_clash_runtime_config(body: RuntimeConfigUpdate):
     data["mixed-port"] = body.mixed_port
     data["allow-lan"] = body.allow_lan
     data["bind-address"] = bind_address
-    path.write_text(
-        yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
-    )
+    _write_clash_yaml(data)
     return {
         "ok": True,
         "runtime_config": {
@@ -546,7 +1174,11 @@ def get_global_group_name():
 @app.put("/api/clash/configs")
 def clash_reload_configs():
     """重载当前配置文件（路径由 Clash 进程启动参数决定）"""
-    r = _clash_request("PUT", "/configs")
+    r = _clash_request(
+        "PUT",
+        "/configs",
+        json={"path": str(Path(config.CLASH_CONFIG_PATH).resolve())},
+    )
     r.raise_for_status()
     return r.json() if r.content else {}
 
@@ -691,6 +1323,103 @@ def clash_proxy_clients():
     return {"clients": _get_proxy_clients()}
 
 
+# ---------- Manager 托管后处理：Claude 精确域名 -> 订阅节点 -> 住宅 SOCKS5 ----------
+def _postprocess_public_payload() -> dict:
+    settings = _load_postprocess_settings()
+    active = _load_clash_config_yaml(Path(config.CLASH_CONFIG_PATH))
+    source: dict | None = None
+    try:
+        source, _, _ = _current_raw_config_for_postprocess()
+    except HTTPException:
+        if isinstance(active, dict):
+            source = _strip_managed_postprocess(active)
+
+    available_groups: list[str] = []
+    resolved_group: str | None = None
+    upstream_error: str | None = None
+    if isinstance(source, dict):
+        try:
+            available_groups = _available_upstream_groups(source)
+            if settings["enabled"]:
+                resolved_group = _resolve_upstream_group(source, settings["upstream_group"])
+        except HTTPException as exc:
+            # This is a state hint for the editor, not a secret-bearing validator
+            # report.  A save/apply still returns its own safe validation error.
+            upstream_error = str(exc.detail)
+
+    residential = settings["residential"]
+    return {
+        "enabled": settings["enabled"],
+        "domains": settings["domains"],
+        "upstream_group": settings["upstream_group"],
+        "non_target_behavior": settings["non_target_behavior"],
+        "resolved_upstream_group": resolved_group,
+        "available_upstream_groups": available_groups,
+        "upstream_error": upstream_error,
+        "residential": {
+            "server": residential["server"],
+            "port": residential["port"],
+            "username": residential["username"],
+            # Password intentionally never crosses the API boundary.
+            "password_configured": bool(residential["password"]),
+        },
+        "mode_note": {
+            "rule": "Rule 模式会将这 15 条精确 DOMAIN 规则置于最前，因此该托管链路可生效。",
+            "global": "Global 模式忽略 rules：链路会保存并随订阅部署，但不会接管这 15 个域名。",
+            "direct": "Direct 模式忽略 rules：链路会保存并随订阅部署，但不会接管这 15 个域名。",
+            "script": "Script 模式由脚本决定路由；不能保证这组 Rule 规则生效。",
+        },
+        "non_target_behavior_note": (
+            "为保持此前 Global 实际行为，Manager 会在 15 条精确规则后加入 MATCH,GLOBAL，并将运行模式设为 Rule；其余流量仍走当前 GLOBAL 选择。"
+            if settings["non_target_behavior"] == "global_passthrough"
+            else "非目标流量继续按订阅原有规则及顺序处理；要让精确规则生效，请使用 Rule 模式。"
+        ),
+        **_managed_postprocess_status(settings, active),
+    }
+
+
+@app.get("/api/postprocess/claude-residential")
+def get_claude_residential_postprocess():
+    return _postprocess_public_payload()
+
+
+@app.put("/api/postprocess/claude-residential")
+def update_claude_residential_postprocess(body: ClaudeResidentialPostprocessUpdate):
+    settings = _settings_from_postprocess_update(body)
+    _save_postprocess_settings(settings)
+    deployment: dict | None = None
+    source = None
+    if body.apply_now:
+        raw, sub_id, source = _current_raw_config_for_postprocess()
+        deployment = _deploy_raw_clash_config(
+            raw,
+            current_sub_id=sub_id,
+            ok_message="托管后处理已保存并已尝试热重载当前配置",
+        )
+    return {
+        "ok": True,
+        "deployment": deployment,
+        "deployment_source": source,
+        **_postprocess_public_payload(),
+    }
+
+
+@app.post("/api/postprocess/claude-residential/apply")
+def apply_claude_residential_postprocess():
+    raw, sub_id, source = _current_raw_config_for_postprocess()
+    deployment = _deploy_raw_clash_config(
+        raw,
+        current_sub_id=sub_id,
+        ok_message="托管后处理已从当前原始订阅缓存部署并已尝试热重载",
+    )
+    return {
+        "ok": True,
+        "deployment": deployment,
+        "deployment_source": source,
+        **_postprocess_public_payload(),
+    }
+
+
 # ---------- 订阅管理 ----------
 def _subscription_cache_file(sub_id: int) -> Path:
     return PROFILE_CACHE_DIR / f"{sub_id}.yaml"
@@ -705,10 +1434,10 @@ def _remove_subscription_cache(sub_id: int) -> None:
 
 
 def _save_subscription_cache_snapshot(sub_id: int, clash_data: dict) -> None:
-    PROFILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    _subscription_cache_file(sub_id).write_text(
+    _ensure_private_dir(PROFILE_CACHE_DIR)
+    _write_private_text(
+        _subscription_cache_file(sub_id),
         yaml.safe_dump(dict(clash_data), allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
     )
 
 
@@ -827,26 +1556,22 @@ def _merge_runtime_into_clash_dict(clash_data: dict) -> None:
 
 def _finalize_subscription_deploy(
     sub_id: int,
-    clash_data: dict,
+    raw_clash_data: dict,
     *,
     update_snapshot: bool,
     ok_message: str,
 ) -> dict:
-    if not isinstance(clash_data, dict):
+    if not isinstance(raw_clash_data, dict):
         raise HTTPException(status_code=502, detail="无效 Clash 配置结构")
-    _merge_runtime_into_clash_dict(clash_data)
-    config_path = Path(config.CLASH_CONFIG_PATH)
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    _write_clash_yaml(clash_data)
+    # profile_cache stays as the provider/converter returned it.  Runtime
+    # fields and the manager overlay exist only in the deployed config.
     if update_snapshot:
-        _save_subscription_cache_snapshot(sub_id, clash_data)
-    try:
-        _clash_request("PUT", "/configs")
-        _restore_persisted_proxy_selections()
-    except Exception:
-        pass
-    _set_current_sub_id(sub_id)
-    return {"ok": True, "message": ok_message, "path": str(config_path)}
+        _save_subscription_cache_snapshot(sub_id, raw_clash_data)
+    return _deploy_raw_clash_config(
+        raw_clash_data,
+        current_sub_id=sub_id,
+        ok_message=ok_message,
+    )
 
 
 def _pull_remote_subscription_to_clash_dict(sub_url: str) -> dict:
@@ -915,9 +1640,9 @@ def _subscription_refresh_cache_only_impl(sub_id: int) -> dict:
     if not sub:
         raise HTTPException(status_code=404, detail="订阅不存在")
     clash_data = _pull_remote_subscription_to_clash_dict(sub["url"])
-    snap = copy.deepcopy(clash_data)
-    _merge_runtime_into_clash_dict(snap)
-    _save_subscription_cache_snapshot(sub_id, snap)
+    # Do not merge runtime values or managed rules into the raw cache.  A later
+    # switch/apply deterministically overlays the then-current manager state.
+    _save_subscription_cache_snapshot(sub_id, clash_data)
     return {
         "ok": True,
         "message": "已更新本地缓存，当前运行配置未改动；点此订阅卡片可从缓存切换。",
